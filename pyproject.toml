@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "financedata"
+version = "0.1.0"
+description = "Shared market data service for DeepSwing and Fond"
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance>=0.2",
+    "pandas>=2.0",
+    "httpx>=0.25",
+    "feedparser>=6.0",
+]
+
+[project.optional-dependencies]
+sentiment = ["transformers>=4.30", "torch>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

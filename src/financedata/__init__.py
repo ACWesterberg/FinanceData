@@ -1,0 +1,72 @@
+"""
+financedata — shared market data service for DeepSwing and Fond.
+
+Install (editable):
+    pip install -e /path/to/FinanceData
+
+Environment variables:
+    FINANCEDATA_DB       — SQLite cache path (default: ~/.financedata/cache.db)
+    ALPHA_VANTAGE_KEY    — Alpha Vantage API key (Nordic price fallback, 25 req/day)
+    NEWS_API_KEY         — NewsAPI key (English-language news)
+    FRED_API_KEY         — FRED API key (US macro indicators)
+"""
+from .cache import DataCache, get_cache
+from .prices import (
+    get_prices,
+    get_prices_batch,
+    get_prices_since,
+    get_current_price,
+    get_vix,
+    get_sector,
+)
+from .indicators import (
+    rsi,
+    rsi_series,
+    atr,
+    vwap,
+    sma,
+    ema,
+    ann_vol,
+    pct_return,
+    key_levels,
+    daily_momentum_score,
+)
+from .news import (
+    get_news,
+    fetch_rss,
+    fetch_newsapi,
+    score_sentiment,
+    score_and_save,
+    build_keyword_map,
+    SWEDISH_RSS_FEEDS,
+)
+from .macro import (
+    get_macro_context,
+    get_macro_indicators_cached,
+    fetch_macro_indicators,
+    build_macro_block,
+    Indicator,
+)
+from .fundamentals import get_fundamentals, ts_to_days
+from .insider import get_insider_summary
+
+__all__ = [
+    # cache
+    "DataCache", "get_cache",
+    # prices
+    "get_prices", "get_prices_batch", "get_prices_since",
+    "get_current_price", "get_vix", "get_sector",
+    # indicators
+    "rsi", "rsi_series", "atr", "vwap", "sma", "ema",
+    "ann_vol", "pct_return", "key_levels", "daily_momentum_score",
+    # news
+    "get_news", "fetch_rss", "fetch_newsapi",
+    "score_sentiment", "score_and_save", "build_keyword_map", "SWEDISH_RSS_FEEDS",
+    # macro
+    "get_macro_context", "get_macro_indicators_cached", "fetch_macro_indicators",
+    "build_macro_block", "Indicator",
+    # fundamentals
+    "get_fundamentals", "ts_to_days",
+    # insider
+    "get_insider_summary",
+]
