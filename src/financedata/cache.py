@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     count       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider, date)
 );
+
+CREATE TABLE IF NOT EXISTS fx_rates (
+    pair        TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    rate        REAL NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (pair, date)
+);
+
+CREATE TABLE IF NOT EXISTS live_prices (
+    ticker      TEXT PRIMARY KEY,
+    price       REAL NOT NULL,
+    price_time  TEXT,
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -248,6 +263,54 @@ class DataCache:
                 (provider, today),
             ).fetchone()
         return row["count"] if row else 0
+
+    # ── FX rates ──────────────────────────────────────────────────────────────
+
+    def save_fx_rate(self, pair: str, date: str, rate: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO fx_rates (pair, date, rate, fetched_at) VALUES (?, ?, ?, ?)",
+                (pair, date, rate, datetime.utcnow().isoformat()),
+            )
+
+    def get_fx_rate(self, pair: str, date: str, *, spot: bool = True) -> float | None:
+        """
+        spot=True  → only return if fetched today (same-day TTL for spot rates)
+        spot=False → historical; return regardless of fetch age
+        """
+        with self._conn() as conn:
+            if spot:
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                row = conn.execute(
+                    "SELECT rate FROM fx_rates WHERE pair = ? AND date = ? AND fetched_at >= ?",
+                    (pair, date, today),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT rate FROM fx_rates WHERE pair = ? AND date = ?",
+                    (pair, date),
+                ).fetchone()
+        return row["rate"] if row else None
+
+    # ── Live prices ───────────────────────────────────────────────────────────
+
+    def save_live_price(self, ticker: str, price: float, price_time: str | None) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO live_prices (ticker, price, price_time, fetched_at) VALUES (?, ?, ?, ?)",
+                (ticker, price, price_time, datetime.utcnow().isoformat()),
+            )
+
+    def get_live_price(self, ticker: str, ttl_minutes: int = 10) -> tuple[float, str | None] | None:
+        """Returns (price, price_time) if within TTL, else None."""
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(minutes=ttl_minutes)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT price, price_time FROM live_prices WHERE ticker = ? AND fetched_at > ?",
+                (ticker, cutoff),
+            ).fetchone()
+        return (row["price"], row["price_time"]) if row else None
 
 
 _instance: DataCache | None = None

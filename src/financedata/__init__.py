@@ -49,6 +49,8 @@ from .macro import (
 )
 from .fundamentals import get_fundamentals, ts_to_days
 from .insider import get_insider_summary
+from .fx import get_fx_rate, to_sek
+from .live import get_live_price, get_live_prices, get_live_price_detail
 
 __all__ = [
     # cache
@@ -69,4 +71,8 @@ __all__ = [
     "get_fundamentals", "ts_to_days",
     # insider
     "get_insider_summary",
+    # fx
+    "get_fx_rate", "to_sek",
+    # live prices
+    "get_live_price", "get_live_prices", "get_live_price_detail",
 ]
