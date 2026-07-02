@@ -37,6 +37,8 @@ _sector_mem: dict[str, str] = {}
 # ── Column normalisation ──────────────────────────────────────────────────────
 
 def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     rename = {c: c.capitalize() for c in df.columns if c.lower() in ("open", "high", "low", "close", "volume")}
     df = df.rename(columns=rename)
     cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns]
