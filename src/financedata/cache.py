@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS live_prices (
     price_time  TEXT,
     fetched_at  TEXT NOT NULL
 );
+
+-- Records the last time news was fetched for a ticker (or reserved market key),
+-- so the read-through cache knows a ticker was checked even when it had no news.
+CREATE TABLE IF NOT EXISTS news_fetch_log (
+    ticker      TEXT PRIMARY KEY,
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -92,6 +99,13 @@ class DataCache:
         self.db_path = db_path or _default_db_path()
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn) -> None:
+        """Lightweight, idempotent migrations for DBs created before a column existed."""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(news)").fetchall()}
+        if "source" not in cols:
+            conn.execute("ALTER TABLE news ADD COLUMN source TEXT")
 
     @contextmanager
     def _conn(self):
@@ -202,23 +216,93 @@ class DataCache:
     # ── News ──────────────────────────────────────────────────────────────────
 
     def save_news(self, ticker: str, items: list[dict]) -> None:
+        """Upsert articles for a ticker, keyed by headline. Tolerates items missing
+        sentiment/source fields (e.g. raw fetches before scoring). Re-seen headlines
+        have their fetched_at refreshed (so they stay inside the cache TTL window)
+        and any newly-provided fields filled in, without creating duplicate rows."""
+        if not items:
+            return
         now = datetime.utcnow().isoformat()
         with self._conn() as conn:
-            conn.executemany(
-                "INSERT INTO news "
-                "(ticker, headline, source_url, published_at, sentiment_label, sentiment_score, fetched_at) "
-                "VALUES (:ticker, :headline, :source_url, :published_at, :sentiment_label, :sentiment_score, :fetched_at)",
-                [{**item, "ticker": ticker, "fetched_at": now} for item in items],
-            )
+            existing = {
+                r["headline"]
+                for r in conn.execute(
+                    "SELECT headline FROM news WHERE ticker = ?", (ticker,)
+                ).fetchall()
+            }
+            inserts, updates = [], []
+            for item in items:
+                headline = item.get("headline")
+                if not headline:
+                    continue
+                row = {
+                    "ticker": ticker,
+                    "headline": headline,
+                    "source_url": item.get("source_url"),
+                    "source": item.get("source"),
+                    "published_at": item.get("published_at"),
+                    "sentiment_label": item.get("sentiment_label"),
+                    "sentiment_score": item.get("sentiment_score"),
+                    "fetched_at": now,
+                }
+                (updates if headline in existing else inserts).append(row)
+
+            if inserts:
+                conn.executemany(
+                    "INSERT INTO news "
+                    "(ticker, headline, source_url, source, published_at, "
+                    "sentiment_label, sentiment_score, fetched_at) "
+                    "VALUES (:ticker, :headline, :source_url, :source, :published_at, "
+                    ":sentiment_label, :sentiment_score, :fetched_at)",
+                    inserts,
+                )
+            if updates:
+                conn.executemany(
+                    "UPDATE news SET "
+                    "fetched_at = :fetched_at, "
+                    "source_url = COALESCE(:source_url, source_url), "
+                    "source = COALESCE(:source, source), "
+                    "published_at = COALESCE(:published_at, published_at), "
+                    "sentiment_label = COALESCE(:sentiment_label, sentiment_label), "
+                    "sentiment_score = COALESCE(:sentiment_score, sentiment_score) "
+                    "WHERE ticker = :ticker AND headline = :headline",
+                    updates,
+                )
 
     def get_news(self, ticker: str, since_date: str) -> list[dict]:
+        """Return stored articles for a ticker with fetched_at >= since_date.
+        since_date may be a date ('YYYY-MM-DD') or a full ISO timestamp."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT headline, published_at, sentiment_label, sentiment_score FROM news "
+                "SELECT headline, source_url, source, published_at, "
+                "sentiment_label, sentiment_score, fetched_at FROM news "
                 "WHERE ticker = ? AND fetched_at >= ? ORDER BY fetched_at DESC",
                 (ticker, since_date),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def mark_news_fetched(self, ticker: str) -> None:
+        """Record that news was just fetched for a ticker (or reserved market key)."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO news_fetch_log (ticker, fetched_at) VALUES (?, ?)",
+                (ticker, datetime.utcnow().isoformat()),
+            )
+
+    def get_stale_news_tickers(self, tickers: list[str], ttl_hours: float = 6.0) -> list[str]:
+        """Tickers whose last news fetch is older than ttl_hours (or never fetched)."""
+        from datetime import timedelta
+        if not tickers:
+            return []
+        cutoff = (datetime.utcnow() - timedelta(hours=ttl_hours)).isoformat()
+        with self._conn() as conn:
+            fresh = {
+                r["ticker"]
+                for r in conn.execute(
+                    "SELECT ticker FROM news_fetch_log WHERE fetched_at > ?", (cutoff,)
+                ).fetchall()
+            }
+        return [t for t in tickers if t not in fresh]
 
     # ── Insider ───────────────────────────────────────────────────────────────
 

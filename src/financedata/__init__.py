@@ -8,6 +8,7 @@ Environment variables:
     FINANCEDATA_DB       — SQLite cache path (default: ~/.financedata/cache.db)
     ALPHA_VANTAGE_KEY    — Alpha Vantage API key (Nordic price fallback, 25 req/day)
     NEWS_API_KEY         — NewsAPI key (English-language news)
+    FINNHUB_API_KEY      — Finnhub key (per-ticker US company-news fallback)
     FRED_API_KEY         — FRED API key (US macro indicators)
 """
 from .cache import DataCache, get_cache
@@ -33,8 +34,13 @@ from .indicators import (
 )
 from .news import (
     get_news,
+    get_news_cached,
+    get_market_headlines,
     fetch_rss,
     fetch_newsapi,
+    fetch_finnhub_news,
+    fetch_yfinance_news,
+    newsapi_available,
     score_sentiment,
     score_and_save,
     build_keyword_map,
@@ -62,7 +68,9 @@ __all__ = [
     "rsi", "rsi_series", "atr", "vwap", "sma", "ema",
     "ann_vol", "pct_return", "key_levels", "daily_momentum_score",
     # news
-    "get_news", "fetch_rss", "fetch_newsapi",
+    "get_news", "get_news_cached", "get_market_headlines",
+    "fetch_rss", "fetch_newsapi", "fetch_finnhub_news", "fetch_yfinance_news",
+    "newsapi_available",
     "score_sentiment", "score_and_save", "build_keyword_map", "SWEDISH_RSS_FEEDS",
     # macro
     "get_macro_context", "get_macro_indicators_cached", "fetch_macro_indicators",

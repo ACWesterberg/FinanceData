@@ -28,7 +28,10 @@ uv sync
 | `FINANCEDATA_DB` | No | SQLite path (default: `~/.financedata/cache.db`) |
 | `ALPHA_VANTAGE_KEY` | No | Enables Alpha Vantage for Nordic daily prices (25 req/day free) |
 | `NEWS_API_KEY` | No | Enables NewsAPI for English-language news |
+| `FINNHUB_API_KEY` | No | Enables Finnhub per-ticker company-news fallback (US-focused, 60 req/min free) |
 | `FRED_API_KEY` | No | Enables US macro data from FRED (Fed rate, CPI, 10Y, unemployment) |
+| `NEWSAPI_SLOW_THRESHOLD_SECONDS` | No | Trip the NewsAPI breaker when a batch stalls this long on 429 backoff (default `8`, `0` disables) |
+| `NEWSAPI_COOLDOWN_MINUTES` | No | How long the breaker skips NewsAPI once tripped (default `20`) |
 
 Everything works without API keys — they just unlock additional data sources.
 
@@ -159,28 +162,57 @@ Fetching is parallelised across tickers. Returns raw yfinance `.info` fields.
 
 ### News
 
-```python
-from financedata import get_news, score_sentiment, score_and_save, SWEDISH_RSS_FEEDS
+News is aggregated from up to four sources, in order: **RSS** (Nordic) → **NewsAPI** (English, `NEWS_API_KEY`) → **Finnhub** (per-ticker US company news, `FINNHUB_API_KEY`) → **yfinance/Yahoo** (universal free backstop). The fallback chain is what lets US tickers — which have no Nordic RSS coverage — still get news.
 
-# Fetch news for a list of tickers from RSS + NewsAPI
+```python
+from financedata import (
+    get_news, get_news_cached, get_market_headlines,
+    score_sentiment, score_and_save, SWEDISH_RSS_FEEDS,
+)
+
+# One-shot fetch (RSS + NewsAPI + optional per-ticker fallback)
 articles = get_news(
     tickers=["AAPL", "VOLV-B.ST"],
     feeds=SWEDISH_RSS_FEEDS,          # or your own list of RSS URLs
     names={"VOLV-B.ST": "Volvo"},     # optional: improves keyword matching
     max_age_hours=72,
     use_newsapi=True,                 # requires NEWS_API_KEY
+    use_fallback=True,                # Finnhub (US) then yfinance for empty tickers
+    market="us",                      # gates Finnhub to US; None/"nordic" skip it
 )
 # → {"VOLV-B.ST": [{"headline": "...", "source_url": "...", "published_at": "...", "source": "..."}, ...]}
-
-# Score headlines with FinBERT (requires pip install financedata[sentiment])
-scores = score_sentiment(["Volvo beats earnings", "Market crash incoming"])
-# → [{"label": "positive", "score": 0.97}, {"label": "negative", "score": 0.91}]
-
-# Score + save to cache in one step
-score_and_save(articles)
 ```
 
-NewsAPI retries on 429 with exponential backoff (up to 5 attempts). Total fetch time is logged at INFO level.
+**Prefer `get_news_cached` for shared, deduplicated fetching.** It's a TTL read-through over the shared SQLite cache, so one project's fetch satisfies another's later read (e.g. the fund's morning scan warms the cache for DeepSwing's post-screen survivors — no re-query).
+
+```python
+# Only stale/missing tickers (older than ttl_hours) hit the network; the rest
+# are served from the shared cache. feeds defaults to SWEDISH_RSS_FEEDS for
+# nordic/None markets and [] for "us".
+articles = get_news_cached(
+    tickers=["AAPL", "MSFT"],
+    market="us",
+    ttl_hours=6,          # per-ticker cache freshness window
+    use_fallback=True,    # on by default here
+)
+```
+
+Market-wide (not ticker-filtered) macro/geopolitical headlines — Nordic from RSS, US from a broad NewsAPI query — cached per market (default 30-min TTL):
+
+```python
+headlines = get_market_headlines("nordic")   # or "us"
+# → [{"headline": "...", "source": "...", "published_at": "..."}, ...] newest-first
+```
+
+Sentiment scoring is unchanged:
+
+```python
+scores = score_sentiment(["Volvo beats earnings", "Market crash incoming"])
+# → [{"label": "positive", "score": 0.97}, {"label": "negative", "score": 0.91}]
+score_and_save(articles)   # scores headlines and upserts them into the shared cache
+```
+
+NewsAPI retries on 429 with exponential backoff (up to 5 attempts). If a batch stalls on backoff, a **breaker** trips and subsequent calls skip NewsAPI (RSS/fallback only) for `NEWSAPI_COOLDOWN_MINUTES` so one throttled ticker can't stall a whole scan. Check `newsapi_available()` to see the current state.
 
 **FinBERT** is optional — install with `pip install financedata[sentiment]`. Falls back to neutral scores if not installed.
 

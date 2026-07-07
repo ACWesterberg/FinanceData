@@ -84,29 +84,39 @@ so 25 restarts in a day could burn 625 AV requests.
 
 ## Step 3 — Replace `src/data/news_fetcher.py`
 
-Delete the file and replace with:
+The shared library now centralizes everything this module used to hand-roll: the
+Finnhub/yfinance fallback chain, the NewsAPI rate-limit breaker, per-ticker TTL
+caching (now persistent + shared across projects), and market-wide headlines.
+Delete the file and replace with thin wrappers:
 
 ```python
 # src/data/news_fetcher.py
 from __future__ import annotations
-from financedata import get_news, SWEDISH_RSS_FEEDS
-import os
+from financedata import get_news_cached, get_market_headlines
 
 
-def fetch_news_for_ticker(ticker: str, market: str) -> list[dict]:
-    """Fetch recent news articles for a given ticker."""
-    feeds = SWEDISH_RSS_FEEDS if market == "nordic" else []
-    use_newsapi = bool(os.environ.get("NEWS_API_KEY"))
-
-    results = get_news(
+def fetch_news_for_ticker(ticker: str, market: str, force_refresh: bool = False) -> list[dict]:
+    """Recent news for a ticker. TTL-cached in the shared DB; Finnhub (US, if
+    FINNHUB_API_KEY set) then yfinance fill in when RSS/NewsAPI are empty."""
+    results = get_news_cached(
         tickers=[ticker],
-        feeds=feeds,
+        market=market,
         max_age_hours=48,
-        use_newsapi=use_newsapi,
+        ttl_hours=1,               # was news_refresh_interval_minutes
+        use_fallback=True,
+        force_refresh=force_refresh,
     )
-    # get_news returns {ticker: [articles]}; flatten to the list this project expects
     return results.get(ticker, [])
+
+
+def fetch_market_headlines(market: str = "nordic", limit: int = 20) -> list[dict]:
+    return get_market_headlines(market, limit=limit)
 ```
+
+The breaker and Finnhub/yfinance fallbacks that lived in the old `news_fetcher.py`
+are gone — they now live in `financedata`. Set `FINNHUB_API_KEY` in the environment
+(no code change) to enable the preferred US per-ticker source. `format_market_environment`
+can stay in DeepSwing as a prompt-formatting helper.
 
 The returned article dicts have the same keys as before:
 `{"title", "description", "source", "published", "url"}` — wait, the shared library

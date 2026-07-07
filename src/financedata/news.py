@@ -1,8 +1,19 @@
 """
-News aggregation: RSS feeds + NewsAPI, with optional FinBERT sentiment scoring.
+News aggregation: RSS + NewsAPI + per-ticker fallbacks (Finnhub, yfinance),
+with optional FinBERT sentiment scoring and a shared SQLite read-through cache.
+
+Sources, in order of use:
+  1. RSS feeds        — Nordic/Swedish coverage, no key required
+  2. NewsAPI          — English-language, needs NEWS_API_KEY
+  3. Finnhub          — per-ticker company news (US-focused), needs FINNHUB_API_KEY
+  4. yfinance (Yahoo) — universal free backstop, no key required
 
 Environment:
-  NEWS_API_KEY — optional; enables NewsAPI for English-language news
+  NEWS_API_KEY                  — optional; enables NewsAPI (English news)
+  FINNHUB_API_KEY               — optional; enables Finnhub per-ticker fallback
+  NEWSAPI_SLOW_THRESHOLD_SECONDS— optional; trip the NewsAPI breaker when a batch
+                                  stalls this long on 429 backoff (default 8; 0 disables)
+  NEWSAPI_COOLDOWN_MINUTES      — optional; how long the breaker skips NewsAPI (default 20)
 
 FinBERT is lazy-loaded; install `financedata[sentiment]` extras to enable it.
 """
@@ -20,6 +31,34 @@ import feedparser
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ── NewsAPI rate-limit breaker ────────────────────────────────────────────────
+# When a NewsAPI batch stalls on 429 backoff, trip a breaker so subsequent calls
+# skip NewsAPI (RSS/fallbacks only) instead of stalling ~1 min per ticker.
+_newsapi_cooldown_until: Optional[datetime] = None
+
+
+def _newsapi_slow_threshold() -> float:
+    try:
+        return float(os.environ.get("NEWSAPI_SLOW_THRESHOLD_SECONDS", "8"))
+    except ValueError:
+        return 8.0
+
+
+def _newsapi_cooldown_minutes() -> int:
+    try:
+        return int(os.environ.get("NEWSAPI_COOLDOWN_MINUTES", "20"))
+    except ValueError:
+        return 20
+
+
+def newsapi_available() -> bool:
+    """True when NEWS_API_KEY is set and the rate-limit breaker isn't tripped."""
+    if not os.environ.get("NEWS_API_KEY"):
+        return False
+    if _newsapi_cooldown_until and datetime.now(timezone.utc) < _newsapi_cooldown_until:
+        return False
+    return True
 
 # Swedish financial RSS feeds (used across both DeepSwing and Fond)
 SWEDISH_RSS_FEEDS: list[str] = [
@@ -190,41 +229,333 @@ def fetch_newsapi(
     return []
 
 
+# ── Per-ticker fallback sources ───────────────────────────────────────────────
+
+def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> list[dict]:
+    """Per-ticker company news via Finnhub (needs FINNHUB_API_KEY). US-focused.
+    Returns [] silently when no key is set or the request fails."""
+    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    if not api_key:
+        return []
+    try:
+        today = datetime.now(timezone.utc).date()
+        params = {
+            "symbol": ticker,
+            "from": (today - timedelta(days=max_age_days)).isoformat(),
+            "to": today.isoformat(),
+            "token": api_key,
+        }
+        resp = httpx.get("https://finnhub.io/api/v1/company-news", params=params, timeout=10.0)
+        resp.raise_for_status()
+        raw = resp.json() or []
+    except Exception as exc:
+        logger.debug("Finnhub news failed for %s: %s", ticker, exc)
+        return []
+
+    items: list[dict] = []
+    for a in raw[:limit]:
+        title = (a.get("headline") or "").strip()
+        if not title:
+            continue
+        published = ""
+        ts = a.get("datetime")
+        if ts:
+            try:
+                published = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, OSError, TypeError):
+                published = ""
+        items.append({
+            "headline": title[:500],
+            "source_url": (a.get("url") or "")[:500],
+            "published_at": published,
+            "source": a.get("source") or "Finnhub",
+        })
+    return items
+
+
+def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
+    """Per-ticker news via yfinance (Yahoo). No API key — the universal backstop.
+    Handles both the newer ('content' envelope) and older (flat) yfinance schemas."""
+    try:
+        import yfinance as yf
+        raw = yf.Ticker(ticker).news or []
+    except Exception as exc:
+        logger.debug("yfinance news failed for %s: %s", ticker, exc)
+        return []
+
+    items: list[dict] = []
+    for entry in raw[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content")
+        if isinstance(content, dict):  # newer schema (yfinance >= ~0.2.40)
+            title = (content.get("title") or "").strip()
+            source = (content.get("provider") or {}).get("displayName") or "Yahoo Finance"
+            url = ((content.get("canonicalUrl") or {}).get("url")
+                   or (content.get("clickThroughUrl") or {}).get("url") or "")
+            published = str(content.get("pubDate") or content.get("displayTime") or "")
+            published = published.replace("T", " ").rstrip("Z")[:16]
+        else:  # older flat schema
+            title = (entry.get("title") or "").strip()
+            source = entry.get("publisher") or "Yahoo Finance"
+            url = entry.get("link") or ""
+            ts = entry.get("providerPublishTime")
+            published = ""
+            if ts:
+                try:
+                    published = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, OSError, TypeError):
+                    published = ""
+        if not title:
+            continue
+        items.append({
+            "headline": title[:500],
+            "source_url": (url or "")[:500],
+            "published_at": published,
+            "source": source,
+        })
+    return items
+
+
+def _fetch_fallback_news(ticker: str, market: str | None) -> list[dict]:
+    """Free per-ticker news when the primary sources (RSS/NewsAPI) are empty.
+    Finnhub is preferred for US tickers when a key is set; yfinance is the
+    universal free backstop for both markets."""
+    if market in (None, "us") and os.environ.get("FINNHUB_API_KEY"):
+        articles = fetch_finnhub_news(ticker)
+        if articles:
+            return articles
+    return fetch_yfinance_news(ticker)
+
+
 def get_news(
     tickers: list[str],
     feeds: list[str],
     names: dict[str, str] | None = None,
     max_age_hours: int = 72,
     use_newsapi: bool = True,
+    use_fallback: bool = False,
+    market: str | None = None,
 ) -> dict[str, list[dict]]:
     """
-    Unified news fetch: RSS feeds + optional NewsAPI.
+    Unified news fetch: RSS feeds + optional NewsAPI + optional per-ticker fallback.
 
-    tickers:  list of Yahoo Finance symbols
-    feeds:    RSS feed URLs to poll
-    names:    optional {ticker: "Company Name"} for better keyword matching
-    Returns:  {ticker: [article_dicts]}
+    tickers:      list of Yahoo Finance symbols
+    feeds:        RSS feed URLs to poll
+    names:        optional {ticker: "Company Name"} for better keyword matching
+    use_newsapi:  query NewsAPI per ticker (subject to the rate-limit breaker)
+    use_fallback: for tickers still empty, try Finnhub (US, if keyed) then yfinance —
+                  essential for US tickers, which have no Nordic RSS coverage
+    market:       "us" | "nordic" | None; gates Finnhub to US in the fallback
+    Returns:      {ticker: [article_dicts]}
     """
+    global _newsapi_cooldown_until
+
     result = fetch_rss(feeds, tickers, names=names, max_age_hours=max_age_hours)
 
-    if use_newsapi:
+    def _merge(ticker: str, articles: list[dict]) -> None:
+        if not articles:
+            return
+        existing = result.get(ticker, [])
+        seen = {a["headline"] for a in existing}
+        for a in articles:
+            if a["headline"] not in seen:
+                existing.append(a)
+                seen.add(a["headline"])
+        if existing:
+            result[ticker] = existing
+
+    if use_newsapi and newsapi_available():
         t0 = time.monotonic()
         for ticker in tickers:
             stem = ticker.rsplit(".", 1)[0].split("-")[0]
-            articles = fetch_newsapi(stem, max_age_hours=max_age_hours)
-            if articles:
-                existing = result.get(ticker, [])
-                seen = {a["headline"] for a in existing}
-                for a in articles:
-                    if a["headline"] not in seen:
-                        existing.append(a)
-                        seen.add(a["headline"])
-                if existing:
-                    result[ticker] = existing
+            _merge(ticker, fetch_newsapi(stem, max_age_hours=max_age_hours))
         elapsed = time.monotonic() - t0
         logger.info("NewsAPI fetch complete: %d tickers in %.1fs", len(tickers), elapsed)
 
+        # A slow batch means we hit 429 backoff — trip the breaker so later calls
+        # skip NewsAPI until the cooldown expires.
+        threshold = _newsapi_slow_threshold()
+        if threshold > 0 and elapsed >= threshold:
+            cooldown = _newsapi_cooldown_minutes()
+            _newsapi_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=cooldown)
+            logger.warning(
+                "NewsAPI stalled %.0fs — skipping NewsAPI for %d min (RSS/fallback only)",
+                elapsed, cooldown,
+            )
+
+    if use_fallback:
+        for ticker in tickers:
+            if not result.get(ticker):
+                _merge(ticker, _fetch_fallback_news(ticker, market))
+
     return result
+
+
+# ── Read-through cache ────────────────────────────────────────────────────────
+
+def get_news_cached(
+    tickers: list[str],
+    feeds: list[str] | None = None,
+    names: dict[str, str] | None = None,
+    max_age_hours: int = 72,
+    ttl_hours: float = 6.0,
+    use_newsapi: bool = True,
+    use_fallback: bool = True,
+    market: str | None = None,
+    force_refresh: bool = False,
+) -> dict[str, list[dict]]:
+    """
+    TTL read-through wrapper around get_news backed by the shared SQLite cache.
+
+    Tickers fetched within ttl_hours are served from the cache; only stale/missing
+    tickers hit the network. This lets one project's fetch satisfy another's later
+    read (e.g. the fund's morning scan warms the cache for DeepSwing's survivors).
+
+    feeds defaults to SWEDISH_RSS_FEEDS for nordic/None markets and [] for "us".
+    Returns {ticker: [article_dicts]} (only tickers with articles are included).
+    """
+    from .cache import get_cache
+    cache = get_cache()
+
+    if feeds is None:
+        feeds = [] if market == "us" else SWEDISH_RSS_FEEDS
+
+    stale = tickers if force_refresh else cache.get_stale_news_tickers(tickers, ttl_hours=ttl_hours)
+    stale_set = set(stale)
+
+    result: dict[str, list[dict]] = {}
+    cutoff = (datetime.utcnow() - timedelta(hours=ttl_hours)).isoformat()
+    for ticker in tickers:
+        if ticker in stale_set:
+            continue
+        rows = cache.get_news(ticker, since_date=cutoff)
+        if rows:
+            result[ticker] = rows
+
+    if stale:
+        fetched = get_news(
+            stale,
+            feeds=feeds,
+            names=names,
+            max_age_hours=max_age_hours,
+            use_newsapi=use_newsapi,
+            use_fallback=use_fallback,
+            market=market,
+        )
+        for ticker in stale:
+            articles = fetched.get(ticker, [])
+            if articles:
+                cache.save_news(ticker, articles)
+                result[ticker] = articles
+            cache.mark_news_fetched(ticker)
+
+    return result
+
+
+# ── Market-wide headlines ─────────────────────────────────────────────────────
+
+# Broad market/macro/geopolitical query for US market-wide headlines (NewsAPI).
+_US_MARKET_QUERY = (
+    '"stock market" OR "Federal Reserve" OR "S&P 500" OR '
+    'inflation OR "oil prices" OR geopolitics'
+)
+
+
+def _market_key(market: str) -> str:
+    """Reserved pseudo-ticker used to cache market-wide headlines in the news table."""
+    return f"__market_{market.lower()}__"
+
+
+def get_market_headlines(
+    market: str = "nordic",
+    feeds: list[str] | None = None,
+    max_age_hours: int = 24,
+    limit: int = 20,
+    ttl_hours: float = 0.5,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """
+    Recent market-wide headlines — NOT filtered to any ticker. This is the macro /
+    geopolitical environment signal. Nordic pulls the RSS feeds directly; US uses a
+    broad NewsAPI query. Cached in shared SQLite per market (default 30 min TTL).
+    Returns [{headline, source, published_at}] newest-first.
+    """
+    from .cache import get_cache
+    cache = get_cache()
+    key = _market_key(market)
+
+    if not force_refresh and not cache.get_stale_news_tickers([key], ttl_hours=ttl_hours):
+        cutoff = (datetime.utcnow() - timedelta(hours=ttl_hours)).isoformat()
+        cached = cache.get_news(key, since_date=cutoff)
+        if cached:
+            return cached[:limit]
+
+    if market == "us":
+        items = _fetch_us_market_headlines(max_age_hours, limit)
+    else:
+        items = _fetch_rss_market_headlines(feeds or SWEDISH_RSS_FEEDS, max_age_hours, limit)
+
+    if items:
+        cache.save_news(key, items)
+    cache.mark_news_fetched(key)
+    logger.info("Market-wide news [%s]: %d headlines", market, len(items))
+    return items
+
+
+def _fetch_rss_market_headlines(feeds: list[str], max_age_hours: int, limit: int) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    items: list[dict] = []
+    seen: set[str] = set()
+
+    for feed_url in feeds:
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as exc:
+            logger.debug("Market RSS error (%s): %s", feed_url, exc)
+            continue
+        source = (getattr(feed.feed, "title", "") or feed_url.split("/")[2])[:30]
+        for entry in getattr(feed, "entries", []):
+            title = (getattr(entry, "title", "") or "").strip()
+            if not title or title.lower() in seen:
+                continue
+            pub_dt = None
+            pub_str = None
+            for attr in ("published_parsed", "updated_parsed"):
+                parsed = getattr(entry, attr, None)
+                if parsed:
+                    pub_dt = datetime(*parsed[:6], tzinfo=timezone.utc)
+                    pub_str = pub_dt.strftime("%Y-%m-%d %H:%M")
+                    break
+            if pub_dt and pub_dt < cutoff:
+                continue
+            seen.add(title.lower())
+            items.append({"headline": title[:500], "source": source, "published_at": pub_str})
+
+    items.sort(key=lambda a: a.get("published_at") or "", reverse=True)
+    return items[:limit]
+
+
+def _fetch_us_market_headlines(max_age_hours: int, limit: int) -> list[dict]:
+    if not newsapi_available():
+        logger.info("US market news skipped — no NEWS_API_KEY (or breaker tripped)")
+        return []
+    articles = fetch_newsapi(_US_MARKET_QUERY, max_age_hours=max_age_hours, page_size=limit)
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for a in articles:
+        title = (a.get("headline") or "").strip()
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        items.append({
+            "headline": title[:500],
+            "source": a.get("source", "NewsAPI"),
+            "published_at": (a.get("published_at") or "").replace("T", " ").rstrip("Z")[:16],
+        })
+    items.sort(key=lambda a: a.get("published_at") or "", reverse=True)
+    return items[:limit]
 
 
 # ── FinBERT sentiment ─────────────────────────────────────────────────────────
