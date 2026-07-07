@@ -11,6 +11,7 @@ Sources, in order of use:
 Environment:
   NEWS_API_KEY                  — optional; enables NewsAPI (English news)
   FINNHUB_API_KEY               — optional; enables Finnhub per-ticker fallback
+  FINNHUB_RATE_LIMIT_PER_MIN    — optional; Finnhub per-minute request cap (default 60)
   NEWSAPI_SLOW_THRESHOLD_SECONDS— optional; trip the NewsAPI breaker when a batch
                                   stalls this long on 429 backoff (default 8; 0 disables)
   NEWSAPI_COOLDOWN_MINUTES      — optional; how long the breaker skips NewsAPI (default 20)
@@ -231,11 +232,38 @@ def fetch_newsapi(
 
 # ── Per-ticker fallback sources ───────────────────────────────────────────────
 
+def _finnhub_limit_per_min() -> int:
+    try:
+        return int(os.environ.get("FINNHUB_RATE_LIMIT_PER_MIN", "60"))
+    except ValueError:
+        return 60
+
+
+def _finnhub_rate_ok() -> bool:
+    """Shared, cross-process per-minute limiter (Finnhub free tier = 60 req/min),
+    tracked in the SQLite rate_limits table keyed by minute. Returns False when the
+    current minute's budget is spent so callers skip Finnhub and fall to yfinance
+    instead of triggering 429s. Best-effort: a small overshoot is possible when
+    multiple processes race within the same minute, hence the default headroom."""
+    from .cache import get_cache
+    cache = get_cache()
+    window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    if cache.get_rate_count("finnhub", window) >= _finnhub_limit_per_min():
+        return False
+    cache.increment_rate_count("finnhub", window)
+    cache.prune_rate_counts("finnhub", window)  # keep only the current minute bucket
+    return True
+
+
 def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> list[dict]:
     """Per-ticker company news via Finnhub (needs FINNHUB_API_KEY). US-focused.
-    Returns [] silently when no key is set or the request fails."""
+    Subject to a shared per-minute rate limiter — returns [] when the key is unset,
+    the minute budget is spent, or the request fails (so the caller falls back)."""
     api_key = os.environ.get("FINNHUB_API_KEY", "")
     if not api_key:
+        return []
+    if not _finnhub_rate_ok():
+        logger.debug("Finnhub per-minute limit reached — skipping %s", ticker)
         return []
     try:
         today = datetime.now(timezone.utc).date()

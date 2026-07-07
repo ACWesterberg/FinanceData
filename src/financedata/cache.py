@@ -325,28 +325,40 @@ class DataCache:
 
     # ── Rate limits ───────────────────────────────────────────────────────────
 
-    def increment_rate_count(self, provider: str) -> int:
-        today = datetime.utcnow().date().isoformat()
+    def increment_rate_count(self, provider: str, period: str | None = None) -> int:
+        """Increment and return the counter for (provider, period). period defaults
+        to today's date (daily quota, e.g. Alpha Vantage); pass a finer key such as
+        a minute bucket for per-minute limits (e.g. Finnhub)."""
+        period = period or datetime.utcnow().date().isoformat()
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO rate_limits (provider, date, count) VALUES (?, ?, 1) "
                 "ON CONFLICT(provider, date) DO UPDATE SET count = count + 1",
-                (provider, today),
+                (provider, period),
             )
             row = conn.execute(
                 "SELECT count FROM rate_limits WHERE provider = ? AND date = ?",
-                (provider, today),
+                (provider, period),
             ).fetchone()
         return row["count"] if row else 1
 
-    def get_rate_count(self, provider: str) -> int:
-        today = datetime.utcnow().date().isoformat()
+    def get_rate_count(self, provider: str, period: str | None = None) -> int:
+        period = period or datetime.utcnow().date().isoformat()
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT count FROM rate_limits WHERE provider = ? AND date = ?",
-                (provider, today),
+                (provider, period),
             ).fetchone()
         return row["count"] if row else 0
+
+    def prune_rate_counts(self, provider: str, keep_period: str) -> None:
+        """Drop stale rate-limit rows for a provider (buckets older than keep_period),
+        so per-minute windows don't accumulate rows indefinitely."""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM rate_limits WHERE provider = ? AND date < ?",
+                (provider, keep_period),
+            )
 
     # ── FX rates ──────────────────────────────────────────────────────────────
 

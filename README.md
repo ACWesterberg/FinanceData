@@ -29,6 +29,7 @@ uv sync
 | `ALPHA_VANTAGE_KEY` | No | Enables Alpha Vantage for Nordic daily prices (25 req/day free) |
 | `NEWS_API_KEY` | No | Enables NewsAPI for English-language news |
 | `FINNHUB_API_KEY` | No | Enables Finnhub per-ticker company-news fallback (US-focused, 60 req/min free) |
+| `FINNHUB_RATE_LIMIT_PER_MIN` | No | Finnhub per-minute request cap, shared across processes (default `60`) |
 | `FRED_API_KEY` | No | Enables US macro data from FRED (Fed rate, CPI, 10Y, unemployment) |
 | `NEWSAPI_SLOW_THRESHOLD_SECONDS` | No | Trip the NewsAPI breaker when a batch stalls this long on 429 backoff (default `8`, `0` disables) |
 | `NEWSAPI_COOLDOWN_MINUTES` | No | How long the breaker skips NewsAPI once tripped (default `20`) |
@@ -214,6 +215,8 @@ score_and_save(articles)   # scores headlines and upserts them into the shared c
 ```
 
 NewsAPI retries on 429 with exponential backoff (up to 5 attempts). If a batch stalls on backoff, a **breaker** trips and subsequent calls skip NewsAPI (RSS/fallback only) for `NEWSAPI_COOLDOWN_MINUTES` so one throttled ticker can't stall a whole scan. Check `newsapi_available()` to see the current state.
+
+Finnhub calls are governed by a **shared per-minute limiter** (`FINNHUB_RATE_LIMIT_PER_MIN`, default 60) tracked in the SQLite cache, so DeepSwing and the Fond apps together stay under the free-tier cap. When the minute budget is spent, Finnhub is skipped and the ticker falls straight through to yfinance — no 429s.
 
 **FinBERT** is optional — install with `pip install financedata[sentiment]`. Falls back to neutral scores if not installed.
 
