@@ -178,7 +178,8 @@ articles = get_news(
     max_age_hours=72,
     use_newsapi=True,                 # requires NEWS_API_KEY
     use_fallback=True,                # Finnhub (US) then yfinance for empty tickers
-    market="us",                      # gates Finnhub to US; None/"nordic" skip it
+    market="us",                      # "us" always tries Finnhub; None infers US per
+                                      # ticker (no suffix = US); "nordic" skips Finnhub
 )
 # → {"VOLV-B.ST": [{"headline": "...", "source_url": "...", "published_at": "...", "source": "..."}, ...]}
 ```

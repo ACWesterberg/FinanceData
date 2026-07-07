@@ -317,11 +317,21 @@ def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
     return items
 
 
+def _looks_us(ticker: str) -> bool:
+    """Heuristic: US Yahoo symbols have no exchange suffix (AAPL, BRK-B), while
+    non-US ones carry a dotted suffix (VOLV-B.ST, AZN.L, SAP.DE). Used to route
+    the Finnhub fallback in mixed/global universes when no explicit market is given."""
+    return "." not in ticker
+
+
 def _fetch_fallback_news(ticker: str, market: str | None) -> list[dict]:
     """Free per-ticker news when the primary sources (RSS/NewsAPI) are empty.
-    Finnhub is preferred for US tickers when a key is set; yfinance is the
-    universal free backstop for both markets."""
-    if market in (None, "us") and os.environ.get("FINNHUB_API_KEY"):
+    Finnhub (US-focused) is preferred for US tickers when a key is set; yfinance is
+    the universal free backstop. With an explicit market="us" Finnhub is always
+    tried; with market=None it's tried only for symbols that look US, so a global
+    universe doesn't waste Finnhub calls on clearly non-US tickers."""
+    try_finnhub = market == "us" or (market is None and _looks_us(ticker))
+    if try_finnhub and os.environ.get("FINNHUB_API_KEY"):
         articles = fetch_finnhub_news(ticker)
         if articles:
             return articles
