@@ -119,6 +119,25 @@ def build_keyword_map(
     return kmap
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _clean_summary(text: str, max_len: int = 300) -> str:
+    """Strip HTML tags / collapse whitespace from an article summary and truncate.
+
+    RSS `summary`/`description` fields often carry HTML markup and boilerplate;
+    we keep a short plain-text snippet so the LLM gets a little context beyond the
+    headline without bloating the prompt."""
+    if not text:
+        return ""
+    clean = _HTML_TAG_RE.sub(" ", text)
+    clean = _WS_RE.sub(" ", clean).strip()
+    if len(clean) > max_len:
+        clean = clean[:max_len].rsplit(" ", 1)[0] + "…"
+    return clean
+
+
 def _match_tickers(text: str, keyword_map: dict[str, list[str]]) -> list[str]:
     text_lower = text.lower()
     return [
@@ -170,9 +189,11 @@ def fetch_rss(
             if published_dt and published_dt < cutoff:
                 continue
 
+            summary_clean = _clean_summary(summary)
             for ticker in _match_tickers(text, keyword_map):
                 ticker_news[ticker].append({
                     "headline": title[:500],
+                    "summary": summary_clean,
                     "source_url": link[:500],
                     "published_at": published_str,
                     "source": source_name,
@@ -294,6 +315,7 @@ def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> l
                 published = ""
         items.append({
             "headline": title[:500],
+            "summary": _clean_summary(a.get("summary") or ""),
             "source_url": (a.get("url") or "")[:500],
             "published_at": published,
             "source": a.get("source") or "Finnhub",
@@ -323,6 +345,7 @@ def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
                    or (content.get("clickThroughUrl") or {}).get("url") or "")
             published = str(content.get("pubDate") or content.get("displayTime") or "")
             published = published.replace("T", " ").rstrip("Z")[:16]
+            summary = content.get("summary") or content.get("description") or ""
         else:  # older flat schema
             title = (entry.get("title") or "").strip()
             source = entry.get("publisher") or "Yahoo Finance"
@@ -334,10 +357,12 @@ def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
                     published = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
                 except (ValueError, OSError, TypeError):
                     published = ""
+            summary = entry.get("summary") or ""
         if not title:
             continue
         items.append({
             "headline": title[:500],
+            "summary": _clean_summary(summary),
             "source_url": (url or "")[:500],
             "published_at": published,
             "source": source,

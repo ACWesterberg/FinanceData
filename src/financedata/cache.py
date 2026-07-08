@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS news (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker          TEXT NOT NULL,
     headline        TEXT NOT NULL,
+    summary         TEXT,
     source_url      TEXT,
     published_at    TEXT,
     sentiment_label TEXT,
@@ -106,6 +107,8 @@ class DataCache:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(news)").fetchall()}
         if "source" not in cols:
             conn.execute("ALTER TABLE news ADD COLUMN source TEXT")
+        if "summary" not in cols:
+            conn.execute("ALTER TABLE news ADD COLUMN summary TEXT")
 
     @contextmanager
     def _conn(self):
@@ -238,6 +241,7 @@ class DataCache:
                 row = {
                     "ticker": ticker,
                     "headline": headline,
+                    "summary": item.get("summary"),
                     "source_url": item.get("source_url"),
                     "source": item.get("source"),
                     "published_at": item.get("published_at"),
@@ -250,9 +254,9 @@ class DataCache:
             if inserts:
                 conn.executemany(
                     "INSERT INTO news "
-                    "(ticker, headline, source_url, source, published_at, "
+                    "(ticker, headline, summary, source_url, source, published_at, "
                     "sentiment_label, sentiment_score, fetched_at) "
-                    "VALUES (:ticker, :headline, :source_url, :source, :published_at, "
+                    "VALUES (:ticker, :headline, :summary, :source_url, :source, :published_at, "
                     ":sentiment_label, :sentiment_score, :fetched_at)",
                     inserts,
                 )
@@ -260,6 +264,7 @@ class DataCache:
                 conn.executemany(
                     "UPDATE news SET "
                     "fetched_at = :fetched_at, "
+                    "summary = COALESCE(:summary, summary), "
                     "source_url = COALESCE(:source_url, source_url), "
                     "source = COALESCE(:source, source), "
                     "published_at = COALESCE(:published_at, published_at), "
@@ -274,7 +279,7 @@ class DataCache:
         since_date may be a date ('YYYY-MM-DD') or a full ISO timestamp."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT headline, source_url, source, published_at, "
+                "SELECT headline, summary, source_url, source, published_at, "
                 "sentiment_label, sentiment_score, fetched_at FROM news "
                 "WHERE ticker = ? AND fetched_at >= ? ORDER BY fetched_at DESC",
                 (ticker, since_date),
