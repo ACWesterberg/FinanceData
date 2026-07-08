@@ -12,9 +12,8 @@ Environment:
   NEWS_API_KEY                  — optional; enables NewsAPI (English news)
   FINNHUB_API_KEY               — optional; enables Finnhub per-ticker fallback
   FINNHUB_RATE_LIMIT_PER_MIN    — optional; Finnhub per-minute request cap (default 60)
-  NEWSAPI_SLOW_THRESHOLD_SECONDS— optional; trip the NewsAPI breaker when a batch
-                                  stalls this long on 429 backoff (default 8; 0 disables)
-  NEWSAPI_COOLDOWN_MINUTES      — optional; how long the breaker skips NewsAPI (default 20)
+  NEWSAPI_COOLDOWN_MINUTES      — optional; how long the breaker skips NewsAPI after a
+                                  429 before retrying (default 20)
 
 FinBERT is lazy-loaded; install `financedata[sentiment]` extras to enable it.
 """
@@ -34,16 +33,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ── NewsAPI rate-limit breaker ────────────────────────────────────────────────
-# When a NewsAPI batch stalls on 429 backoff, trip a breaker so subsequent calls
-# skip NewsAPI (RSS/fallbacks only) instead of stalling ~1 min per ticker.
+# On a 429, trip a breaker so this batch and subsequent calls skip NewsAPI
+# (RSS/fallbacks only) instead of retrying a quota that won't clear until
+# tomorrow.
 _newsapi_cooldown_until: Optional[datetime] = None
-
-
-def _newsapi_slow_threshold() -> float:
-    try:
-        return float(os.environ.get("NEWSAPI_SLOW_THRESHOLD_SECONDS", "8"))
-    except ValueError:
-        return 8.0
 
 
 def _newsapi_cooldown_minutes() -> int:
@@ -60,6 +53,17 @@ def newsapi_available() -> bool:
     if _newsapi_cooldown_until and datetime.now(timezone.utc) < _newsapi_cooldown_until:
         return False
     return True
+
+
+def _trip_newsapi_breaker() -> None:
+    """Skip NewsAPI for the rest of this batch and for NEWSAPI_COOLDOWN_MINUTES
+    afterwards — a 429 almost always means the daily quota is spent, so there's
+    no point hitting it again until the cooldown expires."""
+    global _newsapi_cooldown_until
+    cooldown = _newsapi_cooldown_minutes()
+    _newsapi_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=cooldown)
+    logger.warning("NewsAPI rate-limited — skipping NewsAPI for %d min (RSS/fallback only)", cooldown)
+
 
 # Swedish financial RSS feeds (used across both DeepSwing and Fond)
 SWEDISH_RSS_FEEDS: list[str] = [
@@ -181,9 +185,15 @@ def fetch_newsapi(
     query: str,
     max_age_hours: int = 48,
     page_size: int = 20,
-    max_retries: int = 5,
 ) -> list[dict]:
-    """Fetch English-language news from NewsAPI for a search query, retrying on 429."""
+    """Fetch English-language news from NewsAPI for a search query.
+
+    Gives up immediately on 429 and trips the shared breaker (see
+    `newsapi_available`) instead of retrying with backoff — NewsAPI's free
+    tier is a daily quota, so a 429 won't clear within the same run and
+    retrying just burns time. RSS and the per-ticker fallback sources still
+    cover for it (see `get_news`'s `use_fallback`).
+    """
     api_key = os.environ.get("NEWS_API_KEY", "")
     if not api_key:
         return []
@@ -197,37 +207,27 @@ def fetch_newsapi(
         "pageSize": page_size,
         "apiKey": api_key,
     }
-    delay = 2.0
-    for attempt in range(max_retries):
-        try:
-            resp = httpx.get("https://newsapi.org/v2/everything", params=params, timeout=10)
-            resp.raise_for_status()
-            return [
-                {
-                    "headline": a.get("title", "")[:500],
-                    "source_url": a.get("url", "")[:500],
-                    "published_at": a.get("publishedAt", ""),
-                    "source": a.get("source", {}).get("name", "NewsAPI"),
-                }
-                for a in resp.json().get("articles", [])
-            ]
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
-                retry_after = float(exc.response.headers.get("Retry-After", delay))
-                logger.info(
-                    "NewsAPI rate-limited for '%s' (attempt %d/%d) — waiting %.0fs",
-                    query, attempt + 1, max_retries, retry_after,
-                )
-                time.sleep(retry_after)
-                delay *= 2
-            else:
-                logger.warning("NewsAPI error for '%s': %s", query, exc)
-                return []
-        except Exception as exc:
+    try:
+        resp = httpx.get("https://newsapi.org/v2/everything", params=params, timeout=10)
+        resp.raise_for_status()
+        return [
+            {
+                "headline": a.get("title", "")[:500],
+                "source_url": a.get("url", "")[:500],
+                "published_at": a.get("publishedAt", ""),
+                "source": a.get("source", {}).get("name", "NewsAPI"),
+            }
+            for a in resp.json().get("articles", [])
+        ]
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            _trip_newsapi_breaker()
+        else:
             logger.warning("NewsAPI error for '%s': %s", query, exc)
-            return []
-    logger.warning("NewsAPI gave up for '%s' after %d attempts", query, max_retries)
-    return []
+        return []
+    except Exception as exc:
+        logger.warning("NewsAPI error for '%s': %s", query, exc)
+        return []
 
 
 # ── Per-ticker fallback sources ───────────────────────────────────────────────
@@ -387,8 +387,6 @@ def get_news(
     market:       "us" | "nordic" | None; gates Finnhub to US in the fallback
     Returns:      {ticker: [article_dicts]}
     """
-    global _newsapi_cooldown_until
-
     result = fetch_rss(feeds, tickers, names=names, max_age_hours=max_age_hours)
 
     def _merge(ticker: str, articles: list[dict]) -> None:
@@ -405,22 +403,17 @@ def get_news(
 
     if use_newsapi and newsapi_available():
         t0 = time.monotonic()
+        fetched = 0
         for ticker in tickers:
+            if not newsapi_available():
+                # A 429 tripped the breaker mid-batch — stop hitting NewsAPI for
+                # the rest of these tickers; RSS/fallback still cover them below.
+                break
             stem = ticker.rsplit(".", 1)[0].split("-")[0]
             _merge(ticker, fetch_newsapi(stem, max_age_hours=max_age_hours))
+            fetched += 1
         elapsed = time.monotonic() - t0
-        logger.info("NewsAPI fetch complete: %d tickers in %.1fs", len(tickers), elapsed)
-
-        # A slow batch means we hit 429 backoff — trip the breaker so later calls
-        # skip NewsAPI until the cooldown expires.
-        threshold = _newsapi_slow_threshold()
-        if threshold > 0 and elapsed >= threshold:
-            cooldown = _newsapi_cooldown_minutes()
-            _newsapi_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=cooldown)
-            logger.warning(
-                "NewsAPI stalled %.0fs — skipping NewsAPI for %d min (RSS/fallback only)",
-                elapsed, cooldown,
-            )
+        logger.info("NewsAPI fetch complete: %d/%d tickers in %.1fs", fetched, len(tickers), elapsed)
 
     if use_fallback:
         for ticker in tickers:
