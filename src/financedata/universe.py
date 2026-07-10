@@ -50,6 +50,46 @@ MONTROSE_COUNTRIES: set[str] = {
     "Ireland", "Spain", "Italy", "Netherlands", "Portugal", "Belgium",
 }
 
+# Curated main exchange(s) per country, as EODHD exchange codes. This is the
+# default filter applied on refresh so the universe only contains the primary
+# venue(s) — not every regional exchange EODHD lists (e.g. Germany's 6 regional
+# bourses or Canada's NEO). Pass all_exchanges=True to bypass this.
+#
+# Note: EODHD does not publish a Borsa Italiana / Euronext Milan feed, so Italy
+# has no reachable code and is skipped with a warning (kept here for the future).
+MONTROSE_EXCHANGES: dict[str, list[str]] = {
+    "Sweden":         ["ST"],       # Nasdaq Stockholm
+    "United States":  ["US"],       # NYSE / Nasdaq / NYSE American (sub-filtered below)
+    "Denmark":        ["CO"],       # Nasdaq Copenhagen
+    "Finland":        ["HE"],       # Nasdaq Helsinki
+    "Norway":         ["OL"],       # Euronext Oslo
+    "Canada":         ["TO", "V"],  # Toronto Stock Exchange + TSX Venture
+    "United Kingdom": ["LSE"],      # London Stock Exchange
+    "Switzerland":    ["SW"],       # SIX Swiss Exchange
+    "Poland":         ["WAR"],      # Warsaw Stock Exchange
+    "Austria":        ["VI"],       # Vienna Stock Exchange
+    "Germany":        ["XETRA", "F"],  # Xetra + Frankfurt
+    "France":         ["PA"],       # Euronext Paris
+    "Ireland":        ["IR"],       # Euronext Dublin
+    "Spain":          ["MC"],       # Bolsa de Madrid (BME)
+    "Italy":          ["MI"],       # Euronext Milan — not exposed by EODHD (see note)
+    "Netherlands":    ["AS"],       # Euronext Amsterdam
+    "Portugal":       ["LS"],       # Euronext Lisbon
+    "Belgium":        ["BR"],       # Euronext Brussels
+}
+
+# EODHD lumps every US venue into the "US" code, including OTC/pink-sheet and
+# mutual-fund quotation lines. Restrict to the lit exchanges Montrose trades.
+MONTROSE_SUB_EXCHANGES: dict[str, set[str]] = {
+    "United States": {"NYSE", "NASDAQ", "AMEX", "NYSE MKT"},
+}
+
+# Cleaner per-venue MIC for the US sub-exchanges (the raw "US" MIC is a
+# comma-joined blob). Falls back to the exchange-list MIC when unmapped.
+_US_SUB_MIC = {
+    "NYSE": "XNYS", "NASDAQ": "XNAS", "AMEX": "XASE", "NYSE MKT": "XASE",
+}
+
 COUNTRY_ALIASES = {
     "usa": "United States",
     "us": "United States",
@@ -187,6 +227,7 @@ def _symbols_for_exchange(
     exchange: dict,
     include_etfs: bool,
     include_delisted: bool,
+    sub_allowed: set[str] | None = None,
 ) -> list[dict]:
     payload = _api_get(
         client,
@@ -217,14 +258,25 @@ def _symbols_for_exchange(
         if not ticker or not company:
             continue
 
+        # Some EODHD codes (notably "US") bundle several venues; the per-symbol
+        # Exchange field disambiguates. Restrict and label by it when configured.
+        sub = pick("exchange")
+        exchange_name = exchange["name"]
+        mic = exchange["mic"]
+        if sub_allowed is not None:
+            if sub not in sub_allowed:
+                continue
+            exchange_name = sub or exchange["name"]
+            mic = _US_SUB_MIC.get(sub, exchange["mic"])
+
         rows.append(
             {
                 "key": f"{exchange['code']}:{ticker}",
                 "ticker": ticker,
                 "company_name": company,
-                "exchange": exchange["name"],
+                "exchange": exchange_name,
                 "exchange_code": exchange["code"],
-                "mic": exchange["mic"],
+                "mic": mic,
                 "country": exchange["country"],
                 "isin": pick("isin").upper(),
                 "security_type": sec_type,
@@ -254,10 +306,12 @@ def _download_universe(
                 "Downloading %s — %s (%s)",
                 exch["country"], exch["name"], exch["code"],
             )
+            sub_allowed = MONTROSE_SUB_EXCHANGES.get(exch["country"])
             try:
                 rows.extend(
                     _symbols_for_exchange(
-                        client, token, timeout, exch, include_etfs, include_delisted
+                        client, token, timeout, exch,
+                        include_etfs, include_delisted, sub_allowed,
                     )
                 )
             except RuntimeError as exc:
@@ -276,13 +330,21 @@ def refresh_universe(
     *,
     countries: Iterable[str] | None = None,
     exchange_overrides: dict[str, list[str]] | None = None,
+    all_exchanges: bool = False,
     include_etfs: bool = False,
     include_delisted: bool = False,
+    reset: bool = False,
     timeout: int = 45,
     sleep: float = 0.25,
 ) -> dict:
     """
     Fetch the current universe from EODHD and reconcile it into the shared cache.
+
+    By default only the curated main exchange(s) per country (MONTROSE_EXCHANGES)
+    are pulled, and the US feed is restricted to lit venues (NYSE/Nasdaq/AMEX).
+    Pass all_exchanges=True to ignore that filter, or exchange_overrides to
+    supply your own {country: [codes]} map. Pass reset=True to wipe the stored
+    universe first (use for a clean redefinition of scope).
 
     New listings are inserted, changed listings are updated, and listings that
     disappeared from the source are flagged `status='removed'` (never deleted),
@@ -303,11 +365,20 @@ def refresh_universe(
     if unknown:
         raise ValueError(f"Unsupported countries: {', '.join(sorted(unknown))}")
 
+    if all_exchanges:
+        overrides = None
+    elif exchange_overrides is not None:
+        overrides = exchange_overrides
+    else:
+        overrides = {c: codes for c, codes in MONTROSE_EXCHANGES.items() if c in wanted}
+
     fetched = _download_universe(
-        token, wanted, exchange_overrides, include_etfs, include_delisted, timeout, sleep
+        token, wanted, overrides, include_etfs, include_delisted, timeout, sleep
     )
 
     cache = get_cache()
+    if reset:
+        cache.clear_universe()
     existing = cache.get_universe_map()
     now = datetime.utcnow().isoformat()
 
@@ -474,6 +545,16 @@ def _main(argv: list[str] | None = None) -> int:
     p_refresh.add_argument("--include-etfs", action="store_true")
     p_refresh.add_argument("--include-delisted", action="store_true")
     p_refresh.add_argument(
+        "--all-exchanges",
+        action="store_true",
+        help="Pull every regional exchange, not just the curated main venue(s).",
+    )
+    p_refresh.add_argument(
+        "--reset",
+        action="store_true",
+        help="Wipe the stored universe before refreshing (clean scope redefinition).",
+    )
+    p_refresh.add_argument(
         "--overrides",
         default=None,
         help='JSON file mapping country → exchange codes, e.g. {"Sweden": ["ST"]}.',
@@ -497,8 +578,10 @@ def _main(argv: list[str] | None = None) -> int:
         summary = refresh_universe(
             api_token=args.api_token,
             exchange_overrides=overrides,
+            all_exchanges=args.all_exchanges,
             include_etfs=args.include_etfs,
             include_delisted=args.include_delisted,
+            reset=args.reset,
         )
         print(json.dumps(summary, indent=2))
         return 0

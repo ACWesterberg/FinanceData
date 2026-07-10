@@ -525,6 +525,12 @@ class DataCache:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def clear_universe(self) -> None:
+        """Wipe the universe tables (for a clean redefinition of scope)."""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM universe")
+            conn.execute("DELETE FROM universe_refresh")
+
     def record_universe_refresh(self, summary: dict) -> None:
         with self._conn() as conn:
             conn.execute(

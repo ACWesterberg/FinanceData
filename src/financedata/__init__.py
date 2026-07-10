@@ -66,6 +66,7 @@ from .universe import (
     export_universe,
     last_refresh as last_universe_refresh,
     MONTROSE_COUNTRIES,
+    MONTROSE_EXCHANGES,
 )
 
 __all__ = [
@@ -96,5 +97,5 @@ __all__ = [
     # universe
     "refresh_universe", "get_universe", "get_universe_symbols",
     "get_universe_updates", "export_universe", "last_universe_refresh",
-    "MONTROSE_COUNTRIES",
+    "MONTROSE_COUNTRIES", "MONTROSE_EXCHANGES",
 ]

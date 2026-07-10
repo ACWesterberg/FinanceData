@@ -1,12 +1,13 @@
 {
-  "refreshed_at": "2026-07-10T09:01:50.288668",
+  "refreshed_at": "2026-07-10T09:15:42.647352",
   "source": "eodhd",
-  "total_active": 49797,
+  "scope": "curated main exchanges per country (MONTROSE_EXCHANGES); US lit venues only",
+  "total_active": 28912,
   "countries": {
-    "Germany": 21350,
-    "United States": 18210,
+    "Germany": 12510,
+    "United States": 6332,
     "United Kingdom": 3941,
-    "Canada": 2631,
+    "Canada": 2464,
     "Sweden": 949,
     "France": 637,
     "Poland": 585,
@@ -21,13 +22,16 @@
     "Portugal": 37,
     "Ireland": 21
   },
+  "notes": [
+    "Italy unavailable from EODHD (no Borsa Italiana feed)."
+  ],
   "last_refresh": {
-    "refreshed_at": "2026-07-10T09:01:50.288668",
-    "added": 49797,
+    "refreshed_at": "2026-07-10T09:15:42.647352",
+    "added": 28912,
     "removed": 0,
     "modified": 0,
     "unchanged": 0,
-    "total_active": 49797,
+    "total_active": 28912,
     "source": "eodhd"
   }
 }

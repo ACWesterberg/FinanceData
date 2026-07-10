@@ -285,7 +285,19 @@ summary = refresh_universe()
 
 refresh_universe(include_etfs=True)                 # include ETFs too
 refresh_universe(countries=["Sweden", "Norway"])    # limit the refresh scope
+refresh_universe(reset=True)                         # wipe + reload (clean rescope)
+refresh_universe(all_exchanges=True)                 # every regional venue, not just main
 ```
+
+By default the refresh keeps only the **curated main exchange(s) per country**
+(`MONTROSE_EXCHANGES`) — e.g. Nasdaq Stockholm, Xetra + Frankfurt, TSX + TSX
+Venture — rather than every regional bourse EODHD lists. The US feed is further
+restricted to lit venues (NYSE / Nasdaq / NYSE American), dropping OTC / pink
+sheets / fund-quotation lines. Pass `all_exchanges=True` or your own
+`exchange_overrides={country: [codes]}` to change this.
+
+> **Italy** is unavailable — EODHD publishes no Borsa Italiana / Euronext Milan
+> feed, so it's skipped with a warning.
 
 Or from the shell (ideal for cron / a systemd timer):
 
