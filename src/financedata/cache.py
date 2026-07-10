@@ -86,7 +86,48 @@ CREATE TABLE IF NOT EXISTS news_fetch_log (
     ticker      TEXT PRIMARY KEY,
     fetched_at  TEXT NOT NULL
 );
+
+-- Broker-tradable instrument universe (one row per listing). `status` flips to
+-- 'removed' when a symbol disappears from the source, so downstream projects can
+-- pull incremental updates (added / removed / modified) since their last sync.
+CREATE TABLE IF NOT EXISTS universe (
+    key           TEXT PRIMARY KEY,   -- stable identity: "<exchange_code>:<ticker>"
+    ticker        TEXT NOT NULL,
+    company_name  TEXT,
+    exchange      TEXT,
+    exchange_code TEXT,
+    mic           TEXT,
+    country       TEXT,
+    isin          TEXT,
+    security_type TEXT,
+    currency      TEXT,
+    status        TEXT NOT NULL DEFAULT 'active',
+    first_seen    TEXT NOT NULL,
+    last_seen     TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_universe_country ON universe (country);
+CREATE INDEX IF NOT EXISTS idx_universe_updated ON universe (updated_at);
+CREATE INDEX IF NOT EXISTS idx_universe_status  ON universe (status);
+
+-- Audit log of universe refresh runs.
+CREATE TABLE IF NOT EXISTS universe_refresh (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    refreshed_at  TEXT NOT NULL,
+    added         INTEGER NOT NULL DEFAULT 0,
+    removed       INTEGER NOT NULL DEFAULT 0,
+    modified      INTEGER NOT NULL DEFAULT 0,
+    unchanged     INTEGER NOT NULL DEFAULT 0,
+    total_active  INTEGER NOT NULL DEFAULT 0,
+    source        TEXT
+);
 """
+
+_UNIVERSE_COLUMNS = (
+    "key", "ticker", "company_name", "exchange", "exchange_code", "mic",
+    "country", "isin", "security_type", "currency",
+    "status", "first_seen", "last_seen", "updated_at",
+)
 
 
 def _default_db_path() -> Path:
@@ -412,6 +453,102 @@ class DataCache:
                 (ticker, cutoff),
             ).fetchone()
         return (row["price"], row["price_time"]) if row else None
+
+
+    # ── Universe ──────────────────────────────────────────────────────────────
+
+    def get_universe_map(self) -> dict[str, dict]:
+        """Return every stored listing keyed by its stable `key` (active + removed)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(_UNIVERSE_COLUMNS)} FROM universe"
+            ).fetchall()
+        return {r["key"]: dict(r) for r in rows}
+
+    def bulk_write_universe(self, rows: list[dict]) -> None:
+        """Insert-or-replace full universe rows (new listings and changed ones)."""
+        if not rows:
+            return
+        cols = ", ".join(_UNIVERSE_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _UNIVERSE_COLUMNS)
+        with self._conn() as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO universe ({cols}) VALUES ({placeholders})",
+                [{c: r.get(c) for c in _UNIVERSE_COLUMNS} for r in rows],
+            )
+
+    def touch_universe(self, keys: list[str], ts: str) -> None:
+        """Bump last_seen for listings that are still present but otherwise unchanged."""
+        if not keys:
+            return
+        with self._conn() as conn:
+            conn.executemany(
+                "UPDATE universe SET last_seen = ? WHERE key = ?",
+                [(ts, k) for k in keys],
+            )
+
+    def mark_universe_removed(self, keys: list[str], ts: str) -> None:
+        """Flag listings that vanished from the source as removed."""
+        if not keys:
+            return
+        with self._conn() as conn:
+            conn.executemany(
+                "UPDATE universe SET status = 'removed', updated_at = ? "
+                "WHERE key = ? AND status != 'removed'",
+                [(ts, k) for k in keys],
+            )
+
+    def query_universe(
+        self,
+        countries: list[str] | None = None,
+        *,
+        active_only: bool = True,
+        updated_since: str | None = None,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if active_only:
+            clauses.append("status = 'active'")
+        if updated_since:
+            clauses.append("updated_at > ?")
+            params.append(updated_since)
+        if countries:
+            placeholders = ",".join("?" * len(countries))
+            clauses.append(f"country IN ({placeholders})")
+            params.extend(countries)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(_UNIVERSE_COLUMNS)} FROM universe{where} "
+                "ORDER BY country, exchange_code, ticker",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_universe_refresh(self, summary: dict) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO universe_refresh "
+                "(refreshed_at, added, removed, modified, unchanged, total_active, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    summary.get("refreshed_at", datetime.utcnow().isoformat()),
+                    int(summary.get("added", 0)),
+                    int(summary.get("removed", 0)),
+                    int(summary.get("modified", 0)),
+                    int(summary.get("unchanged", 0)),
+                    int(summary.get("total_active", 0)),
+                    summary.get("source"),
+                ),
+            )
+
+    def last_universe_refresh(self) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT refreshed_at, added, removed, modified, unchanged, total_active, source "
+                "FROM universe_refresh ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
 
 
 _instance: DataCache | None = None

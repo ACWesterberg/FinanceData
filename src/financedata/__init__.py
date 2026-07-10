@@ -10,6 +10,7 @@ Environment variables:
     NEWS_API_KEY         — NewsAPI key (English-language news)
     FINNHUB_API_KEY      — Finnhub key (per-ticker US company-news fallback)
     FRED_API_KEY         — FRED API key (US macro indicators)
+    EODHD_API_TOKEN      — EODHD token (broker universe refresh)
 """
 from .cache import DataCache, get_cache
 from .prices import (
@@ -57,6 +58,15 @@ from .fundamentals import get_fundamentals, ts_to_days
 from .insider import get_insider_summary
 from .fx import get_fx_rate, to_sek
 from .live import get_live_price, get_live_prices, get_live_price_detail
+from .universe import (
+    refresh_universe,
+    get_universe,
+    get_universe_symbols,
+    get_universe_updates,
+    export_universe,
+    last_refresh as last_universe_refresh,
+    MONTROSE_COUNTRIES,
+)
 
 __all__ = [
     # cache
@@ -83,4 +93,8 @@ __all__ = [
     "get_fx_rate", "to_sek",
     # live prices
     "get_live_price", "get_live_prices", "get_live_price_detail",
+    # universe
+    "refresh_universe", "get_universe", "get_universe_symbols",
+    "get_universe_updates", "export_universe", "last_universe_refresh",
+    "MONTROSE_COUNTRIES",
 ]

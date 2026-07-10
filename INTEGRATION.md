@@ -26,7 +26,9 @@ src/financedata/
 │                     shared TTL cache (get_news_cached) + market-wide headlines
 ├── macro.py        — FRED + Riksbank + ECB + yfinance indices (6h TTL)
 ├── fundamentals.py — yfinance .info, parallel fetch (7-day TTL)
-└── insider.py      — SEC EDGAR + FI Insynsregistret (24h TTL)
+├── insider.py      — SEC EDGAR + FI Insynsregistret (24h TTL)
+└── universe.py     — EODHD broker universe, change-tracked in the shared cache
+                      (refresh_universe / get_universe / get_universe_updates)
 ```
 
 ## Environment variables (set in systemd unit or .env on the Pi)

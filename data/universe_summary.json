@@ -1,0 +1,33 @@
+{
+  "refreshed_at": "2026-07-10T09:01:50.288668",
+  "source": "eodhd",
+  "total_active": 49797,
+  "countries": {
+    "Germany": 21350,
+    "United States": 18210,
+    "United Kingdom": 3941,
+    "Canada": 2631,
+    "Sweden": 949,
+    "France": 637,
+    "Poland": 585,
+    "Norway": 293,
+    "Spain": 240,
+    "Switzerland": 227,
+    "Finland": 192,
+    "Denmark": 172,
+    "Belgium": 117,
+    "Netherlands": 112,
+    "Austria": 83,
+    "Portugal": 37,
+    "Ireland": 21
+  },
+  "last_refresh": {
+    "refreshed_at": "2026-07-10T09:01:50.288668",
+    "added": 49797,
+    "removed": 0,
+    "modified": 0,
+    "unchanged": 0,
+    "total_active": 49797,
+    "source": "eodhd"
+  }
+}

@@ -31,6 +31,7 @@ uv sync
 | `FINNHUB_API_KEY` | No | Enables Finnhub per-ticker company-news fallback (US-focused, 60 req/min free) |
 | `FINNHUB_RATE_LIMIT_PER_MIN` | No | Finnhub per-minute request cap, shared across processes (default `60`) |
 | `FRED_API_KEY` | No | Enables US macro data from FRED (Fed rate, CPI, 10Y, unemployment) |
+| `EODHD_API_TOKEN` | For universe refresh | EODHD token used to refresh the broker-tradable instrument universe |
 | `NEWSAPI_SLOW_THRESHOLD_SECONDS` | No | Trip the NewsAPI breaker when a batch stalls this long on 429 backoff (default `8`, `0` disables) |
 | `NEWSAPI_COOLDOWN_MINUTES` | No | How long the breaker skips NewsAPI once tripped (default `20`) |
 
@@ -255,6 +256,81 @@ summary = get_insider_summary("VOLV-B.ST", market="nordic")
 ```
 
 US market uses SEC EDGAR. Nordic market uses FI Insynsregistret.
+
+---
+
+### Universe (broker-tradable instruments)
+
+FinanceData maintains one complete, up-to-date universe of the instruments
+tradable in the 18 countries covered by the brokerage (Montrose), sourced from
+EODHD and stored in the shared cache. **Other projects never re-fetch it** — they
+read the full set, or pull only what changed since their last sync.
+
+```python
+from financedata import (
+    refresh_universe, get_universe, get_universe_symbols,
+    get_universe_updates, export_universe, last_universe_refresh,
+    MONTROSE_COUNTRIES,
+)
+```
+
+**Refreshing (run on a schedule on the Pi — this is the only step that hits EODHD):**
+
+```python
+# Reconciles the source into the cache: inserts new listings, updates changed
+# ones, and flags vanished ones as removed (never deletes). Needs EODHD_API_TOKEN.
+summary = refresh_universe()
+# → {"refreshed_at": ..., "added": 12, "removed": 3, "modified": 5,
+#    "unchanged": 41000, "total_active": 41017}
+
+refresh_universe(include_etfs=True)                 # include ETFs too
+refresh_universe(countries=["Sweden", "Norway"])    # limit the refresh scope
+```
+
+Or from the shell (ideal for cron / a systemd timer):
+
+```bash
+export EODHD_API_TOKEN=...
+python -m financedata.universe refresh          # fetch + reconcile
+python -m financedata.universe status           # show last refresh summary
+python -m financedata.universe export out.csv   # dump the cached universe
+```
+
+**Reading the universe (no network — pure cache reads):**
+
+```python
+rows = get_universe()                                   # list[dict], all countries
+rows = get_universe(["Sweden", "United States"])        # filtered
+df   = get_universe(as_dataframe=True)                  # pandas DataFrame
+tickers = get_universe_symbols(["Sweden"])              # just the tickers
+```
+
+Each row has: `key`, `ticker`, `company_name`, `exchange`, `exchange_code`,
+`mic`, `country`, `isin`, `security_type`, `currency`, `status`, `first_seen`,
+`last_seen`, `updated_at`. `key` (`"<exchange_code>:<ticker>"`) is the stable
+identity across refreshes.
+
+**Incremental updates — how downstream projects stay in sync:**
+
+Each project persists the `as_of` timestamp it last saw and passes it back as
+`since`, so it only ever processes deltas — additions, removals, and field
+changes (e.g. a re-ticker or ISIN correction):
+
+```python
+delta = get_universe_updates(since=my_last_sync)   # optionally countries=[...]
+# → {"since": ..., "as_of": ...,
+#    "added":    [row, ...],   # new to the broker
+#    "removed":  [row, ...],   # delisted / no longer tradable (status='removed')
+#    "modified": [row, ...]}   # existing listing whose fields changed
+
+for row in delta["added"]:    add_to_my_universe(row)
+for row in delta["removed"]:  drop_from_my_universe(row["key"])
+for row in delta["modified"]: update_my_universe(row)
+
+my_last_sync = delta["as_of"]   # persist for next time
+```
+
+`last_universe_refresh()` returns metadata about the most recent refresh run.
 
 ---
 
