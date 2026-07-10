@@ -68,7 +68,7 @@ MONTROSE_EXCHANGES: dict[str, list[str]] = {
     "Switzerland":    ["SW"],       # SIX Swiss Exchange
     "Poland":         ["WAR"],      # Warsaw Stock Exchange
     "Austria":        ["VI"],       # Vienna Stock Exchange
-    "Germany":        ["XETRA", "F"],  # Xetra + Frankfurt
+    "Germany":        ["XETRA"],    # Xetra (Frankfurt floor excluded — foreign secondary quotes)
     "France":         ["PA"],       # Euronext Paris
     "Ireland":        ["IR"],       # Euronext Dublin
     "Spain":          ["MC"],       # Bolsa de Madrid (BME)

@@ -290,8 +290,8 @@ refresh_universe(all_exchanges=True)                 # every regional venue, not
 ```
 
 By default the refresh keeps only the **curated main exchange(s) per country**
-(`MONTROSE_EXCHANGES`) — e.g. Nasdaq Stockholm, Xetra + Frankfurt, TSX + TSX
-Venture — rather than every regional bourse EODHD lists. The US feed is further
+(`MONTROSE_EXCHANGES`) — e.g. Nasdaq Stockholm, Xetra, TSX + TSX Venture —
+rather than every regional bourse EODHD lists. The US feed is further
 restricted to lit venues (NYSE / Nasdaq / NYSE American), dropping OTC / pink
 sheets / fund-quotation lines. Pass `all_exchanges=True` or your own
 `exchange_overrides={country: [codes]}` to change this.

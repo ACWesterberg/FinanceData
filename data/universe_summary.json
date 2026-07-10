@@ -1,14 +1,14 @@
 {
-  "refreshed_at": "2026-07-10T09:15:42.647352",
+  "refreshed_at": "2026-07-10T09:18:55.110311",
   "source": "eodhd",
-  "scope": "curated main exchanges per country (MONTROSE_EXCHANGES); US lit venues only",
-  "total_active": 28912,
+  "scope": "curated main exchanges per country (MONTROSE_EXCHANGES); US lit venues only; Germany XETRA-only",
+  "total_active": 17119,
   "countries": {
-    "Germany": 12510,
     "United States": 6332,
     "United Kingdom": 3941,
     "Canada": 2464,
     "Sweden": 949,
+    "Germany": 717,
     "France": 637,
     "Poland": 585,
     "Norway": 293,
@@ -26,12 +26,12 @@
     "Italy unavailable from EODHD (no Borsa Italiana feed)."
   ],
   "last_refresh": {
-    "refreshed_at": "2026-07-10T09:15:42.647352",
-    "added": 28912,
+    "refreshed_at": "2026-07-10T09:18:55.110311",
+    "added": 17119,
     "removed": 0,
     "modified": 0,
     "unchanged": 0,
-    "total_active": 28912,
+    "total_active": 17119,
     "source": "eodhd"
   }
 }
