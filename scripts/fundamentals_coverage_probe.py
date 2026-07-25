@@ -6,23 +6,26 @@ Compares, field-by-field, what each provider actually returns for the same ticke
 
     yfinance .info   — the source under financedata.get_fundamentals today (baseline)
     Twelve Data      — /statistics + /profile   (needs TWELVEDATA_API_KEY)
-    EODHD            — /api/fundamentals         (needs EODHD_API_TOKEN)
+    EODHD            — /api/fundamentals         (needs EODHD_API_TOKEN, Fundamentals plan)
 
-It scores the ~22 fields the fund manager consumes, and — the number that actually
-decides this — prints a per-field FILL RATE across the Nordic sample, since Nordic is
-exactly where cheap providers fall down. A provider is only worth paying for if the
-statement-derived fields (debt_to_equity, gross_margin, growth) come back populated
-for .ST names, not just the US ones.
+It scores the ~18 numeric fields the fund manager consumes and prints a per-field FILL
+RATE across the Nordic sample — the number that actually decides this, since Nordic is
+where cheap feeds fall down. Crucially it ALSO prints a diagnostics section explaining
+*why* any cell is empty (rate-limited vs symbol-not-found vs plan-restricted), so a 0%
+is never mistaken for "bad data" when it's really "wrong token" or "throttled".
 
 Run:
-    export TWELVEDATA_API_KEY=...     # optional — grab a free trial key
-    export EODHD_API_TOKEN=...        # optional — you already have this
-    python scripts/fundamentals_coverage_probe.py                 # default sample
+    export TWELVEDATA_API_KEY=...     # optional — free trial key
+    export EODHD_API_TOKEN=...        # optional — must be a *Fundamentals*-plan token
+    python scripts/fundamentals_coverage_probe.py                 # small default sample
     python scripts/fundamentals_coverage_probe.py --nordic 8 --us 4
-    python scripts/fundamentals_coverage_probe.py --tickers ERIC-B.ST,AAPL
+    python scripts/fundamentals_coverage_probe.py --tickers ERIC-B.ST,AAPL --sleep 10
 
-No key for a provider ⇒ that column is skipped (not failed). yfinance runs if importable.
-This only ever GETs data — it never writes to the shared cache.
+Notes:
+- Twelve Data's trial is ~8 credits/min and /statistics is heavy; keep the sample small
+  and --sleep high, or you'll see 'out of API credits' in diagnostics. 429s auto-retry once.
+- A provider with no key is skipped (not failed). yfinance runs only if importable.
+- This only ever GETs data — it never writes to the shared cache.
 """
 from __future__ import annotations
 
@@ -38,20 +41,23 @@ from typing import Any, Callable, Optional
 
 
 def _get_json(url: str, params: dict, timeout: float = 30) -> tuple[int, Any]:
-    """Minimal stdlib GET → (status, parsed_json_or_None). No third-party deps."""
+    """Stdlib GET → (status, parsed_json). Returns the error BODY too, so provider
+    error messages ('symbol not found', 'out of credits') are visible, not swallowed."""
     q = urllib.parse.urlencode(params)
     req = urllib.request.Request(f"{url}?{q}", headers={"User-Agent": "financedata-probe/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return 0, None
+        try:
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return e.code, None
+    except Exception as exc:
+        return 0, {"_transport_error": str(exc)}
+
 
 # ── Canonical fields (mirror financedata.fundamentals._FIELD_MAP) ───────────────
-# "core" = numeric decision inputs we score for coverage; the rest are shown but
-# not scored (currency/sector/website are strings, timestamps are situational).
 CORE_FIELDS = [
     "market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ev_to_ebitda",
     "price_to_sales", "profit_margin", "gross_margin", "roe", "debt_to_equity",
@@ -60,9 +66,6 @@ CORE_FIELDS = [
 ]
 META_FIELDS = ["currency", "sector", "website"]
 ALL_FIELDS = CORE_FIELDS + META_FIELDS
-
-# Fields that come from financial statements — where yfinance .info is usually blank
-# and a real feed should earn its money.
 STATEMENT_FIELDS = {"gross_margin", "debt_to_equity", "revenue_growth", "earnings_growth", "ev_to_ebitda"}
 
 DEFAULT_NORDIC = [
@@ -73,7 +76,6 @@ DEFAULT_US = ["AAPL", "MSFT", "NVDA", "JPM", "XOM"]
 
 
 def _num(v: Any) -> Optional[float]:
-    """Coerce to a real number; treat blanks/sentinels/non-finite as missing."""
     if v is None:
         return None
     if isinstance(v, str):
@@ -94,17 +96,15 @@ def _num(v: Any) -> Optional[float]:
 
 
 def _present(field: str, value: Any) -> bool:
-    """Is this field actually populated? A 0.0 ratio counts as missing, not data."""
     if field in META_FIELDS:
         return isinstance(value, str) and value.strip() not in ("", "NA", "None", "-")
     n = _num(value)
     if n is None:
         return False
-    if field in ("analyst_count",):
+    if field == "analyst_count":
         return n > 0
     if field in ("fifty_two_week_high", "fifty_two_week_low", "market_cap", "analyst_target_price"):
         return n != 0
-    # ratios/margins/growth: a true 0.0 is almost always "not reported"
     return n != 0.0
 
 
@@ -116,18 +116,28 @@ def _dig(d: Any, *path: str) -> Any:
     return d
 
 
-# ── Providers ───────────────────────────────────────────────────────────────
-def fetch_yfinance(ticker: str) -> Optional[dict]:
+def _td_error(body: Any) -> Optional[str]:
+    """Return a short reason string if a Twelve Data body is an error, else None."""
+    if isinstance(body, dict):
+        if "_transport_error" in body:
+            return f"transport: {body['_transport_error'][:50]}"
+        if body.get("status") == "error":
+            return f"{body.get('code', '?')}: {str(body.get('message', ''))[:70]}"
+    return None
+
+
+# ── Providers: each returns (flat_dict_or_None, note_or_None) ────────────────
+def fetch_yfinance(ticker: str) -> tuple[Optional[dict], Optional[str]]:
     try:
         import yfinance as yf
     except Exception:
-        return None
+        return None, "yfinance not importable"
     try:
         info = yf.Ticker(ticker).info or {}
-    except Exception:
-        return None
+    except Exception as exc:
+        return {}, f"error: {str(exc)[:60]}"
     if not info or info.get("quoteType") == "NONE":
-        return {}
+        return {}, "no .info returned"
     return {
         "market_cap": info.get("marketCap"),
         "pe_ratio": info.get("trailingPE"),
@@ -150,28 +160,29 @@ def fetch_yfinance(ticker: str) -> Optional[dict]:
         "currency": info.get("currency"),
         "sector": info.get("sector"),
         "website": info.get("website"),
-    }
+    }, None
 
 
 def _eodhd_symbol(ticker: str) -> str:
-    # Nordic already carries .ST (the code EODHD uses for Nasdaq Stockholm); US → .US
     return ticker if "." in ticker else f"{ticker}.US"
 
 
-def fetch_eodhd(ticker: str, token: str) -> Optional[dict]:
+def fetch_eodhd(ticker: str, token: str) -> tuple[Optional[dict], Optional[str]]:
     sym = _eodhd_symbol(ticker)
     status, d = _get_json(
         f"https://eodhd.com/api/fundamentals/{sym}",
         {"api_token": token, "fmt": "json"},
     )
+    if status in (401, 402, 403):
+        return {}, f"{status}: token lacks Fundamentals-plan access"
+    if status == 404:
+        return {}, "404: symbol not found on EODHD"
     if status != 200 or not isinstance(d, dict) or not d:
-        return {}
+        msg = _dig(d, "_transport_error") if isinstance(d, dict) else None
+        return {}, f"{status}: {msg or 'empty/unexpected response'}"
     ratings = _dig(d, "AnalystRatings") or {}
-    analyst_count = None
-    counts = [ratings.get(k) for k in ("StrongBuy", "Buy", "Hold", "Sell", "StrongSell")]
-    nums = [_num(c) for c in counts]
-    if any(n is not None for n in nums):
-        analyst_count = sum(n for n in nums if n is not None)
+    nums = [_num(ratings.get(k)) for k in ("StrongBuy", "Buy", "Hold", "Sell", "StrongSell")]
+    analyst_count = sum(n for n in nums if n is not None) if any(n is not None for n in nums) else None
     return {
         "market_cap": _dig(d, "Highlights", "MarketCapitalization"),
         "pe_ratio": _dig(d, "Highlights", "PERatio") or _dig(d, "Valuation", "TrailingPE"),
@@ -180,9 +191,9 @@ def fetch_eodhd(ticker: str, token: str) -> Optional[dict]:
         "ev_to_ebitda": _dig(d, "Valuation", "EnterpriseValueEbitda"),
         "price_to_sales": _dig(d, "Valuation", "PriceSalesTTM"),
         "profit_margin": _dig(d, "Highlights", "ProfitMargin"),
-        "gross_margin": _dig(d, "Highlights", "GrossProfitTTM"),  # absolute, not a margin — see notes
+        "gross_margin": _dig(d, "Highlights", "GrossProfitTTM"),  # absolute, not a ratio — see notes
         "roe": _dig(d, "Highlights", "ReturnOnEquityTTM"),
-        "debt_to_equity": _dig(d, "Financials", "Balance_Sheet", "quarterly") and None,  # statement-nested; probe reports as depth signal
+        "debt_to_equity": None,  # statement-nested on EODHD; not a Highlights field
         "revenue_growth": _dig(d, "Highlights", "QuarterlyRevenueGrowthYOY"),
         "earnings_growth": _dig(d, "Highlights", "QuarterlyEarningsGrowthYOY"),
         "beta": _dig(d, "Technicals", "Beta"),
@@ -194,25 +205,10 @@ def fetch_eodhd(ticker: str, token: str) -> Optional[dict]:
         "currency": _dig(d, "General", "CurrencyCode"),
         "sector": _dig(d, "General", "Sector"),
         "website": _dig(d, "General", "WebURL"),
-    }
+    }, None
 
 
-def _twelvedata_params(ticker: str, key: str) -> dict:
-    if ticker.endswith(".ST"):
-        return {"symbol": ticker[:-3], "mic_code": "XSTO", "apikey": key}
-    return {"symbol": ticker, "apikey": key}
-
-
-def fetch_twelvedata(ticker: str, key: str) -> Optional[dict]:
-    base = _twelvedata_params(ticker, key)
-    ss, stats = _get_json("https://api.twelvedata.com/statistics", base)
-    ps, prof = _get_json("https://api.twelvedata.com/profile", base)
-    stats = stats if (ss == 200 and isinstance(stats, dict)) else {}
-    prof = prof if (ps == 200 and isinstance(prof, dict)) else {}
-    if isinstance(stats, dict) and stats.get("status") == "error":
-        stats = {}
-    if isinstance(prof, dict) and prof.get("status") == "error":
-        prof = {}
+def _parse_td(stats: Any, prof: Any) -> dict:
     s = _dig(stats, "statistics") or {}
     val = s.get("valuations_metrics") or {}
     fin = s.get("financials") or {}
@@ -220,6 +216,7 @@ def fetch_twelvedata(ticker: str, key: str) -> Optional[dict]:
     bal = fin.get("balance_sheet") or {}
     px = s.get("stock_price_summary") or {}
     div = s.get("dividends_and_splits") or {}
+    prof = prof if isinstance(prof, dict) else {}
     return {
         "market_cap": val.get("market_capitalization"),
         "pe_ratio": val.get("trailing_pe"),
@@ -245,9 +242,42 @@ def fetch_twelvedata(ticker: str, key: str) -> Optional[dict]:
     }
 
 
+def _td_call(params: dict, backoff: float) -> tuple[Any, Optional[str]]:
+    """One /statistics call with a single 429 retry. Returns (body, error_note)."""
+    _, body = _get_json("https://api.twelvedata.com/statistics", params)
+    err = _td_error(body)
+    if err and err.startswith("429"):
+        print(f"    …rate-limited, waiting {backoff:.0f}s and retrying once", file=sys.stderr)
+        time.sleep(backoff)
+        _, body = _get_json("https://api.twelvedata.com/statistics", params)
+        err = _td_error(body)
+    return body, err
+
+
+def fetch_twelvedata(ticker: str, key: str, backoff: float) -> tuple[Optional[dict], Optional[str]]:
+    # Primary Nordic mapping is mic_code=XSTO; if TD says 'not found', retry with exchange=Stockholm.
+    if ticker.endswith(".ST"):
+        base = {"symbol": ticker[:-3], "mic_code": "XSTO", "apikey": key}
+    else:
+        base = {"symbol": ticker, "apikey": key}
+
+    stats, err = _td_call(base, backoff)
+    if err and "not found" in err.lower() and ticker.endswith(".ST"):
+        alt = {"symbol": ticker[:-3], "exchange": "Stockholm", "apikey": key}
+        stats2, err2 = _td_call(alt, backoff)
+        if not err2:
+            stats, err = stats2, None
+        else:
+            return {}, f"{err}  (also tried exchange=Stockholm → {err2})"
+    if err:
+        return {}, err
+
+    _, prof = _get_json("https://api.twelvedata.com/profile", base)
+    return _parse_td(stats, prof), None
+
+
 # ── Scoring / reporting ─────────────────────────────────────────────────────
 def score(rows: dict, provider: str, tickers: list[str]) -> dict:
-    """Return {field: fill_fraction} over the given tickers for one provider."""
     out = {}
     for f in ALL_FIELDS:
         got = sum(1 for t in tickers if rows.get((t, provider)) and _present(f, rows[(t, provider)].get(f)))
@@ -256,18 +286,18 @@ def score(rows: dict, provider: str, tickers: list[str]) -> dict:
 
 
 def core_count(data: Optional[dict]) -> str:
-    if data is None:
-        return "  -"
+    if not data:
+        return "  ·"
     n = sum(1 for f in CORE_FIELDS if _present(f, data.get(f)))
     return f"{n:>2}/{len(CORE_FIELDS)}"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fundamentals coverage probe")
-    ap.add_argument("--nordic", type=int, default=6, help="how many Nordic tickers (default 6)")
-    ap.add_argument("--us", type=int, default=3, help="how many US tickers (default 3)")
+    ap.add_argument("--nordic", type=int, default=4, help="how many Nordic tickers (default 4)")
+    ap.add_argument("--us", type=int, default=2, help="how many US tickers (default 2)")
     ap.add_argument("--tickers", type=str, default="", help="comma-separated override list")
-    ap.add_argument("--sleep", type=float, default=1.0, help="seconds between Twelve Data calls (trial: 8/min)")
+    ap.add_argument("--sleep", type=float, default=8.0, help="seconds between Twelve Data tickers (trial ~8/min)")
     args = ap.parse_args()
 
     if args.tickers:
@@ -280,15 +310,14 @@ def main() -> int:
     td_key = os.environ.get("TWELVEDATA_API_KEY", "")
     eodhd_token = os.environ.get("EODHD_API_TOKEN", "")
 
-    providers: list[tuple[str, Callable[[str], Optional[dict]]]] = []
+    providers: list[tuple[str, Callable[[str], tuple[Optional[dict], Optional[str]]]]] = []
     try:
         import yfinance  # noqa: F401
         providers.append(("yfinance", fetch_yfinance))
     except Exception:
-        print("• yfinance not importable — baseline column skipped\n", file=sys.stderr)
-
+        print("• yfinance not importable — baseline column skipped", file=sys.stderr)
     if td_key:
-        providers.append(("twelvedata", lambda t: fetch_twelvedata(t, td_key)))
+        providers.append(("twelvedata", lambda t: fetch_twelvedata(t, td_key, args.sleep)))
     else:
         print("• TWELVEDATA_API_KEY unset — Twelve Data column skipped", file=sys.stderr)
     if eodhd_token:
@@ -302,23 +331,24 @@ def main() -> int:
 
     names = [n for n, _ in providers]
     rows: dict = {}
+    diag: list[tuple[str, str, str]] = []   # (provider, ticker, reason)
     print(f"\nProbing {len(tickers)} tickers × {len(names)} providers: {', '.join(names)}\n")
 
-    # ── per-ticker core-field counts ────────────────────────────────────────
     hdr = f"{'ticker':<12} " + "  ".join(f"{n:>10}" for n in names)
     print(hdr)
     print("-" * len(hdr))
     for t in tickers:
         cells = []
         for name, fn in providers:
-            data = fn(t)
+            data, note = fn(t)
             rows[(t, name)] = data
+            if note:
+                diag.append((name, t, note))
             cells.append(f"{core_count(data):>10}")
             if name == "twelvedata":
                 time.sleep(args.sleep)
         print(f"{t:<12} " + "  ".join(cells))
 
-    # ── per-field fill rate on the NORDIC subset (the decision) ──────────────
     if nordic:
         print(f"\nNordic field fill-rate  (n={len(nordic)}: {', '.join(nordic)})\n")
         scores = {name: score(rows, name, nordic) for name in names}
@@ -329,11 +359,27 @@ def main() -> int:
             marker = " *" if f in STATEMENT_FIELDS else "  "
             cells = "  ".join(f"{scores[n][f] * 100:>9.0f}%" for n in names)
             print(f"{f:<22}{marker}" + cells)
-        print("\n  * = statement-derived field (where yfinance .info is usually blank)")
+        print("\n  * = statement-derived field (where yfinance .info is often blank)")
+
+    if diag:
+        print("\nDiagnostics — why cells are empty (dedup'd):\n")
+        seen = set()
+        for provider, ticker, reason in diag:
+            key = (provider, reason)
+            if key in seen:
+                continue
+            seen.add(key)
+            example = "" if reason.count(ticker) else f"  [e.g. {ticker}]"
+            print(f"  {provider:<11} {reason}{example}")
+        print(
+            "\n  → A 0% column with 'token lacks ...' or 'out of credits' is a PLAN/QUOTA"
+            "\n    problem, not data quality. Only 'symbol not found' with a valid symbol"
+            "\n    means genuine no-coverage."
+        )
 
     print(
-        "\nHow to read this: a provider only justifies its price if the Nordic '*' rows"
-        "\nfill in where yfinance is blank. High US coverage is table stakes — everyone has it."
+        "\nHow to read this: judge a paid feed only on Nordic '*' rows that fill where"
+        "\nyfinance is blank — AND only once its diagnostics line is clean (real access)."
     )
     return 0
 
