@@ -192,13 +192,18 @@ def probe_eodhd(ticker: str, token: str) -> Result:
     return r
 
 
-def _td_params(ticker: str, key: str, extra: dict) -> dict:
-    if ticker.endswith(".ST"):
-        p = {"symbol": ticker[:-3], "mic_code": "XSTO", "apikey": key}
-    else:
-        p = {"symbol": ticker, "apikey": key}
-    p.update(extra)
-    return p
+NORDIC_MICS = {"XSTO", "XHEL", "XCSE", "XOSL"}
+NORDIC_COUNTRIES = {"Sweden", "Finland", "Denmark", "Norway"}
+
+
+def _td_symbol_search(base: str, key: str) -> list:
+    """Ask Twelve Data what it actually lists for a symbol → [{symbol, mic_code, exchange, country}]."""
+    _, body = _get_json(
+        "https://api.twelvedata.com/symbol_search",
+        {"symbol": base, "outputsize": 30, "apikey": key},
+    )
+    data = body.get("data") if isinstance(body, dict) else None
+    return data if isinstance(data, list) else []
 
 
 def probe_twelvedata(ticker: str, key: str, backoff: float) -> Result:
@@ -214,18 +219,31 @@ def probe_twelvedata(ticker: str, key: str, backoff: float) -> Result:
             err = _td_error(body)
         return body, err
 
-    params = _td_params(ticker, key, {"interval": "1day", "outputsize": "90"})
-    body, err = _ts(params)
-    if err and "not found" in err.lower() and ticker.endswith(".ST"):
-        alt = _td_params(ticker, key, {"interval": "1day", "outputsize": "90"})
-        alt.pop("mic_code", None)
-        alt["exchange"] = "Stockholm"
-        body2, err2 = _ts(alt)
-        if not err2:
-            body, err, params = body2, None, alt
-        else:
-            r.note = f"{err}  (also tried exchange=Stockholm → {err2})"
+    # Resolve the symbol TD expects. For Nordic, let symbol_search tell us the exact
+    # symbol/MIC rather than guessing — that's the difference between "wrong format"
+    # and "genuinely no Stockholm coverage".
+    if ticker.endswith(".ST"):
+        base = ticker[:-3]
+        matches = _td_symbol_search(base, key)
+        nordic = [m for m in matches
+                  if m.get("mic_code") in NORDIC_MICS or m.get("country") in NORDIC_COUNTRIES]
+        if not nordic:
+            if matches:
+                venues = sorted({str(m.get("mic_code") or m.get("exchange") or m.get("country")) for m in matches})
+                r.note = f"no Nordic listing in symbol_search for '{base}' (TD lists only: {', '.join(venues[:8])})"
+            else:
+                r.note = f"symbol_search found nothing for '{base}'"
             return r
+        m = nordic[0]
+        base_params = {"symbol": m.get("symbol", base), "apikey": key}
+        if m.get("mic_code"):
+            base_params["mic_code"] = m["mic_code"]
+        elif m.get("exchange"):
+            base_params["exchange"] = m["exchange"]
+    else:
+        base_params = {"symbol": ticker, "apikey": key}
+
+    body, err = _ts(dict(base_params, interval="1day", outputsize="90"))
     if err:
         r.note = err
         return r
@@ -242,12 +260,7 @@ def probe_twelvedata(ticker: str, key: str, backoff: float) -> Result:
     else:
         r.note = "no values in time_series response"
 
-    # live quote (cheap, 1 credit)
-    qp = _td_params(ticker, key, {})
-    if "exchange" in params:
-        qp.pop("mic_code", None)
-        qp["exchange"] = "Stockholm"
-    _, q = _get_json("https://api.twelvedata.com/quote", qp)
+    _, q = _get_json("https://api.twelvedata.com/quote", base_params)   # live quote (1 credit)
     if isinstance(q, dict) and not _td_error(q):
         try:
             r.live = float(q.get("close"))
@@ -283,6 +296,12 @@ def _close_cell(r: Result) -> str:
     if r.last_close is None:
         return "       ·"
     return f"{r.last_close:>8.2f}"
+
+
+def _live_cell(r: Result) -> str:
+    if r.live is None:
+        return "       ·"
+    return f"{r.live:>8.2f}"
 
 
 def main() -> int:
@@ -359,6 +378,15 @@ def main() -> int:
             spread = (max(closes) - min(closes)) / min(closes)
             if spread > 0.02:
                 print(f"{'':<12}   ⚠ closes disagree by {spread * 100:.0f}% — check symbol/currency/adjustment")
+
+    # live/most-recent quote — matters for DeepSwing's entry fills
+    print("\nLive quote (native currency) — the price entries would actually fill at:\n")
+    lhdr = f"{'ticker':<12} " + "  ".join(f"{n:>10}" for n in names)
+    print(lhdr)
+    print("-" * len(lhdr))
+    for t in tickers:
+        cells = "  ".join(f"{_live_cell(results[(t, n)]):>10}" for n in names)
+        print(f"{t:<12} " + cells)
 
     if diag:
         print("\nDiagnostics — why cells are empty (dedup'd):\n")
