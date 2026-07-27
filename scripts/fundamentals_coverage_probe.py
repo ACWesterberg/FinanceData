@@ -57,6 +57,29 @@ def _get_json(url: str, params: dict, timeout: float = 30) -> tuple[int, Any]:
         return 0, {"_transport_error": str(exc)}
 
 
+def _load_env(explicit: Optional[str] = None) -> list[str]:
+    """Load KEY=VALUE lines from .env files into os.environ (without clobbering already-set
+    vars). Searches: --env-file, ./.env, ../DeepSwing/.env, ../ai-fund-manager/.env."""
+    from pathlib import Path
+    cwd = Path.cwd()
+    candidates = [Path(explicit)] if explicit else []
+    candidates += [cwd / ".env", cwd.parent / "DeepSwing" / ".env", cwd.parent / "ai-fund-manager" / ".env"]
+    loaded = []
+    for p in candidates:
+        if not p or not p.is_file():
+            continue
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+        loaded.append(str(p))
+    return loaded
+
+
 # ── Canonical fields (mirror financedata.fundamentals._FIELD_MAP) ───────────────
 CORE_FIELDS = [
     "market_cap", "pe_ratio", "forward_pe", "pb_ratio", "ev_to_ebitda",
@@ -298,7 +321,12 @@ def main() -> int:
     ap.add_argument("--us", type=int, default=2, help="how many US tickers (default 2)")
     ap.add_argument("--tickers", type=str, default="", help="comma-separated override list")
     ap.add_argument("--sleep", type=float, default=8.0, help="seconds between Twelve Data tickers (trial ~8/min)")
+    ap.add_argument("--env-file", type=str, default="", help="path to a .env with the API keys")
     args = ap.parse_args()
+
+    loaded = _load_env(args.env_file or None)
+    if loaded:
+        print(f"• loaded env from: {', '.join(loaded)}", file=sys.stderr)
 
     if args.tickers:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]

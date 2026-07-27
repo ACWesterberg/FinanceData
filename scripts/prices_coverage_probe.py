@@ -58,6 +58,30 @@ def _get_json(url: str, params: dict, timeout: float = 30) -> tuple[int, Any]:
         return 0, {"_transport_error": str(exc)}
 
 
+def _load_env(explicit: Optional[str] = None) -> list[str]:
+    """Load KEY=VALUE lines from .env files into os.environ (without clobbering already-set
+    vars), so keys can live in a file instead of exported shell vars. Returns paths loaded.
+    Searches: --env-file, ./.env, and sibling ../DeepSwing/.env, ../ai-fund-manager/.env."""
+    from pathlib import Path
+    cwd = Path.cwd()
+    candidates = [Path(explicit)] if explicit else []
+    candidates += [cwd / ".env", cwd.parent / "DeepSwing" / ".env", cwd.parent / "ai-fund-manager" / ".env"]
+    loaded = []
+    for p in candidates:
+        if not p or not p.is_file():
+            continue
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+        loaded.append(str(p))
+    return loaded
+
+
 DEFAULT_NORDIC = [
     "ERIC-B.ST", "VOLV-B.ST", "SAND.ST", "SEB-A.ST", "INVE-B.ST",
     "ATCO-A.ST", "HM-B.ST", "NIBE-B.ST", "EVO.ST", "ASSA-B.ST",
@@ -114,11 +138,12 @@ def probe_yfinance(ticker: str) -> Result:
         r.note = "no history returned"
         return r
     r.bars = len(hist)
-    r.last_date = hist.index[-1].strftime("%Y-%m-%d")
     try:
-        r.last_close = float(hist["Close"].iloc[-1])
+        closes = hist["Close"].dropna()   # yfinance can trail a NaN row (forming day / action)
+        r.last_close = float(closes.iloc[-1])
+        r.last_date = closes.index[-1].strftime("%Y-%m-%d")
     except Exception:
-        pass
+        r.last_date = hist.index[-1].strftime("%Y-%m-%d")
     try:
         import yfinance as yf
         fi = yf.Ticker(ticker).fast_info
@@ -266,7 +291,12 @@ def main() -> int:
     ap.add_argument("--us", type=int, default=2)
     ap.add_argument("--tickers", type=str, default="")
     ap.add_argument("--sleep", type=float, default=8.0, help="seconds between Twelve Data tickers")
+    ap.add_argument("--env-file", type=str, default="", help="path to a .env with the API keys")
     args = ap.parse_args()
+
+    loaded = _load_env(args.env_file or None)
+    if loaded:
+        print(f"• loaded env from: {', '.join(loaded)}", file=sys.stderr)
 
     if args.tickers:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
