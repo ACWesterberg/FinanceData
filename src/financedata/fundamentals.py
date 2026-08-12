@@ -25,7 +25,14 @@ _FIELD_MAP: dict[str, str] = {
     "marketCap":                        "market_cap",
     "profitMargins":                    "profit_margin",
     "grossMargins":                     "gross_margin",
+    "operatingMargins":                 "operating_margin",
+    "ebitdaMargins":                    "ebitda_margin",
     "returnOnEquity":                   "roe",
+    "returnOnAssets":                   "roa",
+    "freeCashflow":                     "free_cash_flow",
+    "operatingCashflow":                "operating_cash_flow",
+    "totalDebt":                        "total_debt",
+    "totalCash":                        "total_cash",
     "debtToEquity":                     "debt_to_equity",
     "revenueGrowth":                    "revenue_growth",
     "earningsGrowth":                   "earnings_growth",
@@ -42,9 +49,11 @@ _FIELD_MAP: dict[str, str] = {
     "sector":                           "sector",
 }
 
+# Fields yfinance returns as a 0-1 fraction rather than a percentage. Values are
+# cached raw, so a consumer rendering them as percentages multiplies by 100.
 _FRACTION_FIELDS = {
-    "profit_margin", "gross_margin", "roe",
-    "revenue_growth", "earnings_growth", "dividend_yield",
+    "profit_margin", "gross_margin", "operating_margin", "ebitda_margin",
+    "roe", "roa", "revenue_growth", "earnings_growth", "dividend_yield",
 }
 
 
