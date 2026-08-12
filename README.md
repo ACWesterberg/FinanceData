@@ -160,6 +160,23 @@ from financedata import ts_to_days
 
 Fetching is parallelised across tickers. Returns raw yfinance `.info` fields.
 
+Cached keys, by group:
+
+| Group | Keys |
+|-------|------|
+| Valuation | `pe_ratio`, `forward_pe`, `pb_ratio`, `ev_to_ebitda`, `price_to_sales`, `market_cap` |
+| Profitability | `gross_margin`, `operating_margin`, `ebitda_margin`, `profit_margin`, `roe`, `roa` |
+| Cash flow & balance sheet | `free_cash_flow`, `operating_cash_flow`, `total_cash`, `total_debt`, `debt_to_equity` |
+| Growth | `revenue_growth`, `earnings_growth` |
+| Market & analyst | `beta`, `fifty_two_week_high`, `fifty_two_week_low`, `dividend_yield`, `analyst_target_price`, `analyst_count` |
+| Meta | `currency`, `sector`, `website`, `earnings_timestamp`, `ex_div_timestamp` |
+
+Margins, returns, growth rates and dividend yield are cached **as yfinance
+returns them — 0-1 fractions, not percentages** (`_FRACTION_FIELDS`); multiply
+by 100 to display. Any key can be `None` for a ticker whose `.info` omits it
+(cash-flow and margin fields are commonly absent for funds, ETFs and some
+financials), so read defensively.
+
 ---
 
 ### News
