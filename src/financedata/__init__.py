@@ -36,6 +36,7 @@ from .indicators import (
 from .news import (
     get_news,
     get_news_cached,
+    get_news_cached_with_provenance,
     get_market_headlines,
     fetch_rss,
     fetch_newsapi,
@@ -54,7 +55,9 @@ from .macro import (
     build_macro_block,
     Indicator,
 )
-from .fundamentals import get_fundamentals, ts_to_days
+from .fundamentals import get_fundamentals, get_fundamentals_with_provenance, ts_to_days
+from .contracts import DataProvenance, DataResult
+from .testing import FakeFinanceData
 from .insider import get_insider_summary
 from .fx import get_fx_rate, to_sek
 from .live import get_live_price, get_live_prices, get_live_price_detail
@@ -71,7 +74,7 @@ from .universe import (
 
 __all__ = [
     # cache
-    "DataCache", "get_cache",
+    "DataCache", "get_cache", "DataProvenance", "DataResult", "FakeFinanceData",
     # prices
     "get_prices", "get_prices_batch", "get_prices_since",
     "get_current_price", "get_vix", "get_sector",
@@ -79,7 +82,7 @@ __all__ = [
     "rsi", "rsi_series", "atr", "vwap", "sma", "ema",
     "ann_vol", "pct_return", "key_levels", "daily_momentum_score",
     # news
-    "get_news", "get_news_cached", "get_market_headlines",
+    "get_news", "get_news_cached", "get_news_cached_with_provenance", "get_market_headlines",
     "fetch_rss", "fetch_newsapi", "fetch_finnhub_news", "fetch_yfinance_news",
     "newsapi_available",
     "score_sentiment", "score_and_save", "build_keyword_map", "SWEDISH_RSS_FEEDS",
@@ -87,7 +90,7 @@ __all__ = [
     "get_macro_context", "get_macro_indicators_cached", "fetch_macro_indicators",
     "build_macro_block", "Indicator",
     # fundamentals
-    "get_fundamentals", "ts_to_days",
+    "get_fundamentals", "get_fundamentals_with_provenance", "ts_to_days",
     # insider
     "get_insider_summary",
     # fx
