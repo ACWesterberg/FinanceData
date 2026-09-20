@@ -24,13 +24,28 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+from .contracts import DataProvenance, DataResult
 
 import feedparser
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Set only by the provenance-aware entry point.  Context-local storage keeps
+# concurrent callers isolated while allowing the existing provider functions to
+# retain their public return types.
+_provider_events: ContextVar[list[dict] | None] = ContextVar("news_provider_events", default=None)
+_provider_ticker: ContextVar[str | None] = ContextVar("news_provider_ticker", default=None)
+
+
+def _record_provider(provider: str, status: str, *, ticker: str | None = None, warning: str | None = None) -> None:
+    events = _provider_events.get()
+    if events is not None:
+        events.append({"provider": provider, "status": status, "ticker": ticker, "warning": warning})
 
 # ── NewsAPI rate-limit breaker ────────────────────────────────────────────────
 # On a 429, trip a breaker so this batch and subsequent calls skip NewsAPI
@@ -167,7 +182,14 @@ def fetch_rss(
             feed = feedparser.parse(feed_url)
         except Exception as exc:
             logger.debug("RSS error (%s): %s", feed_url, exc)
+            _record_provider(f"rss:{feed_url}", "failure", warning=str(exc))
             continue
+
+        if getattr(feed, "bozo", False):
+            warning = str(getattr(feed, "bozo_exception", "malformed RSS response"))
+            _record_provider(f"rss:{feed_url}", "failure", warning=warning)
+        else:
+            _record_provider(f"rss:{feed_url}", "success")
 
         source_name = getattr(feed.feed, "title", feed_url.split("/")[2])[:30]
 
@@ -217,6 +239,7 @@ def fetch_newsapi(
     """
     api_key = os.environ.get("NEWS_API_KEY", "")
     if not api_key:
+        _record_provider("newsapi", "unavailable", ticker=_provider_ticker.get(), warning="NEWS_API_KEY is not configured")
         return []
 
     since = (datetime.utcnow() - timedelta(hours=max_age_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -231,7 +254,7 @@ def fetch_newsapi(
     try:
         resp = httpx.get("https://newsapi.org/v2/everything", params=params, timeout=10)
         resp.raise_for_status()
-        return [
+        articles = [
             {
                 "headline": a.get("title", "")[:500],
                 "source_url": a.get("url", "")[:500],
@@ -240,14 +263,19 @@ def fetch_newsapi(
             }
             for a in resp.json().get("articles", [])
         ]
+        _record_provider("newsapi", "success" if articles else "empty", ticker=_provider_ticker.get())
+        return articles
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
             _trip_newsapi_breaker()
+            _record_provider("newsapi", "rate_limited", ticker=_provider_ticker.get(), warning="HTTP 429")
         else:
             logger.warning("NewsAPI error for '%s': %s", query, exc)
+            _record_provider("newsapi", "failure", ticker=_provider_ticker.get(), warning=str(exc))
         return []
     except Exception as exc:
         logger.warning("NewsAPI error for '%s': %s", query, exc)
+        _record_provider("newsapi", "failure", ticker=_provider_ticker.get(), warning=str(exc))
         return []
 
 
@@ -269,11 +297,9 @@ def _finnhub_rate_ok() -> bool:
     from .cache import get_cache
     cache = get_cache()
     window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
-    if cache.get_rate_count("finnhub", window) >= _finnhub_limit_per_min():
-        return False
-    cache.increment_rate_count("finnhub", window)
+    claimed = cache.claim_rate_limit("finnhub", window, _finnhub_limit_per_min())
     cache.prune_rate_counts("finnhub", window)  # keep only the current minute bucket
-    return True
+    return claimed
 
 
 def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> list[dict]:
@@ -282,9 +308,11 @@ def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> l
     the minute budget is spent, or the request fails (so the caller falls back)."""
     api_key = os.environ.get("FINNHUB_API_KEY", "")
     if not api_key:
+        _record_provider("finnhub", "unavailable", ticker=ticker, warning="FINNHUB_API_KEY is not configured")
         return []
     if not _finnhub_rate_ok():
         logger.debug("Finnhub per-minute limit reached — skipping %s", ticker)
+        _record_provider("finnhub", "rate_limited", ticker=ticker, warning="per-minute limit reached")
         return []
     try:
         today = datetime.now(timezone.utc).date()
@@ -299,6 +327,7 @@ def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> l
         raw = resp.json() or []
     except Exception as exc:
         logger.debug("Finnhub news failed for %s: %s", ticker, exc)
+        _record_provider("finnhub", "failure", ticker=ticker, warning=str(exc))
         return []
 
     items: list[dict] = []
@@ -320,6 +349,7 @@ def fetch_finnhub_news(ticker: str, max_age_days: int = 7, limit: int = 10) -> l
             "published_at": published,
             "source": a.get("source") or "Finnhub",
         })
+    _record_provider("finnhub", "success" if items else "empty", ticker=ticker)
     return items
 
 
@@ -331,6 +361,7 @@ def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
         raw = yf.Ticker(ticker).news or []
     except Exception as exc:
         logger.debug("yfinance news failed for %s: %s", ticker, exc)
+        _record_provider("yfinance", "failure", ticker=ticker, warning=str(exc))
         return []
 
     items: list[dict] = []
@@ -367,6 +398,7 @@ def fetch_yfinance_news(ticker: str, limit: int = 10) -> list[dict]:
             "published_at": published,
             "source": source,
         })
+    _record_provider("yfinance", "success" if items else "empty", ticker=ticker)
     return items
 
 
@@ -429,16 +461,27 @@ def get_news(
     if use_newsapi and newsapi_available():
         t0 = time.monotonic()
         fetched = 0
-        for ticker in tickers:
+        for index, ticker in enumerate(tickers):
             if not newsapi_available():
                 # A 429 tripped the breaker mid-batch — stop hitting NewsAPI for
                 # the rest of these tickers; RSS/fallback still cover them below.
+                for skipped in tickers[index:]:
+                    _record_provider("newsapi", "rate_limited", ticker=skipped, warning="cooldown active")
                 break
             stem = ticker.rsplit(".", 1)[0].split("-")[0]
-            _merge(ticker, fetch_newsapi(stem, max_age_hours=max_age_hours))
+            token = _provider_ticker.set(ticker)
+            try:
+                _merge(ticker, fetch_newsapi(stem, max_age_hours=max_age_hours))
+            finally:
+                _provider_ticker.reset(token)
             fetched += 1
         elapsed = time.monotonic() - t0
         logger.info("NewsAPI fetch complete: %d/%d tickers in %.1fs", fetched, len(tickers), elapsed)
+    elif use_newsapi:
+        status = "rate_limited" if os.environ.get("NEWS_API_KEY") else "unavailable"
+        warning = "cooldown active" if status == "rate_limited" else "NEWS_API_KEY is not configured"
+        for ticker in tickers:
+            _record_provider("newsapi", status, ticker=ticker, warning=warning)
 
     if use_fallback:
         for ticker in tickers:
@@ -471,6 +514,30 @@ def get_news_cached(
     feeds defaults to SWEDISH_RSS_FEEDS for nordic/None markets and [] for "us".
     Returns {ticker: [article_dicts]} (only tickers with articles are included).
     """
+    return get_news_cached_with_provenance(
+        tickers, feeds=feeds, names=names, max_age_hours=max_age_hours,
+        ttl_hours=ttl_hours, use_newsapi=use_newsapi, use_fallback=use_fallback,
+        market=market, force_refresh=force_refresh,
+    ).items
+
+
+def get_news_cached_with_provenance(
+    tickers: list[str],
+    feeds: list[str] | None = None,
+    names: dict[str, str] | None = None,
+    max_age_hours: int = 72,
+    ttl_hours: float = 6.0,
+    use_newsapi: bool = True,
+    use_fallback: bool = True,
+    market: str | None = None,
+    force_refresh: bool = False,
+) -> DataResult[dict[str, list[dict]]]:
+    """News payload with per-ticker cache, coverage, window, and failure metadata.
+
+    Unlike :func:`get_news_cached`, this also returns stale cached articles when a
+    refresh raises, marking them ``stale_fallback``. Empty successful refreshes
+    remain distinguishable from failures and rate limiting in ``provenance``.
+    """
     from .cache import get_cache
     cache = get_cache()
 
@@ -481,6 +548,9 @@ def get_news_cached(
     stale_set = set(stale)
 
     result: dict[str, list[dict]] = {}
+    provenance: dict[str, DataProvenance] = {}
+    now = datetime.now(timezone.utc)
+    requested_start = (now - timedelta(hours=max_age_hours)).isoformat()
     cutoff = (datetime.utcnow() - timedelta(hours=ttl_hours)).isoformat()
     for ticker in tickers:
         if ticker in stale_set:
@@ -488,25 +558,87 @@ def get_news_cached(
         rows = cache.get_news(ticker, since_date=cutoff)
         if rows:
             result[ticker] = rows
+        provenance[ticker] = _news_provenance(
+            rows, "cache_hit", "complete", (), requested_start, now,
+            ("cache",), cache.get_news_fetch_time(ticker),
+        )
 
     if stale:
-        fetched = get_news(
-            stale,
-            feeds=feeds,
-            names=names,
-            max_age_hours=max_age_hours,
-            use_newsapi=use_newsapi,
-            use_fallback=use_fallback,
-            market=market,
-        )
+        failure: Exception | None = None
+        provider_events: list[dict] = []
+        event_token = _provider_events.set(provider_events)
+        try:
+            fetched = get_news(
+                stale, feeds=feeds, names=names, max_age_hours=max_age_hours,
+                use_newsapi=use_newsapi, use_fallback=use_fallback, market=market,
+            )
+        except Exception as exc:
+            logger.warning("News refresh failed: %s", exc)
+            fetched, failure = {}, exc
+        finally:
+            _provider_events.reset(event_token)
         for ticker in stale:
             articles = fetched.get(ticker, [])
             if articles:
                 cache.save_news(ticker, articles)
                 result[ticker] = articles
-            cache.mark_news_fetched(ticker)
+            events = [e for e in provider_events if e["ticker"] in (None, ticker)]
+            warnings = [f'{e["provider"]}: {e["warning"]}' for e in events if e["warning"]]
+            state = "live_refresh" if articles else "genuine_empty"
+            completeness = "complete" if articles else "empty"
+            providers = tuple(dict.fromkeys(e["provider"] for e in events))
+            if not providers:
+                providers = _requested_news_providers(feeds, use_newsapi, use_fallback)
+            statuses = {e["status"] for e in events}
+            if failure is not None:
+                old = cache.get_news(ticker, since_date="1970-01-01")
+                if old:
+                    result[ticker] = old
+                    state, completeness = "stale_fallback", "partial"
+                else:
+                    state, completeness = "provider_failure", "unavailable"
+                warnings.append(f"aggregation: {failure}")
+            elif statuses & {"failure", "rate_limited", "unavailable"}:
+                if articles:
+                    state, completeness = "partial_coverage", "partial"
+                else:
+                    old = cache.get_news(ticker, since_date="1970-01-01")
+                    if old and statuses & {"failure", "rate_limited"}:
+                        result[ticker] = old
+                        state, completeness = "stale_fallback", "partial"
+                    elif "rate_limited" in statuses and "failure" not in statuses:
+                        state, completeness = "rate_limited", "unavailable"
+                    elif statuses == {"unavailable"}:
+                        state, completeness = "provider_unavailable", "unavailable"
+                    else:
+                        state = "provider_failure" if "failure" in statuses else "partial_coverage"
+                        completeness = "unavailable" if state == "provider_failure" else "partial"
+            if failure is None and not (statuses & {"failure", "rate_limited"}) and statuses & {"success", "empty"}:
+                cache.mark_news_fetched(ticker)
+            provenance[ticker] = _news_provenance(
+                result.get(ticker, []), state, completeness, warnings,
+                requested_start, now, providers, cache.get_news_fetch_time(ticker),
+            )
 
-    return result
+    return DataResult(items=result, provenance=provenance)
+
+
+def _requested_news_providers(feeds: list[str], use_newsapi: bool, use_fallback: bool) -> tuple[str, ...]:
+    providers = (["rss"] if feeds else []) + (["newsapi"] if use_newsapi else [])
+    if use_fallback:
+        providers.append("finnhub/yfinance")
+    return tuple(providers) or ("none",)
+
+
+def _news_provenance(items, cache_state, completeness, warnings, requested_start, now, providers, retrieved_at):
+    dates = sorted(str(item.get("published_at")) for item in items if item.get("published_at"))
+    return DataProvenance(
+        provider_names=providers, requested_start=requested_start,
+        requested_end=now.isoformat(), effective_start=dates[0] if dates else None,
+        effective_end=dates[-1] if dates else None,
+        retrieved_at=retrieved_at or now.isoformat(), cache_state=cache_state,
+        completeness=completeness, warnings=tuple(warnings),
+    )
 
 
 # ── Market-wide headlines ─────────────────────────────────────────────────────

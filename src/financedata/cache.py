@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS universe_refresh (
 );
 """
 
+_SCHEMA_VERSION = 1
+
 _UNIVERSE_COLUMNS = (
     "key", "ticker", "company_name", "exchange", "exchange_code", "mic",
     "country", "isin", "security_type", "currency",
@@ -145,16 +147,24 @@ class DataCache:
 
     def _migrate(self, conn) -> None:
         """Lightweight, idempotent migrations for DBs created before a column existed."""
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Cache schema {version} is newer than supported schema {_SCHEMA_VERSION}"
+            )
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(news)").fetchall()}
         if "source" not in cols:
             conn.execute("ALTER TABLE news ADD COLUMN source TEXT")
         if "summary" not in cols:
             conn.execute("ALTER TABLE news ADD COLUMN summary TEXT")
+        if version < _SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
         try:
             yield conn
             conn.commit()
@@ -327,6 +337,14 @@ class DataCache:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_news_fetch_time(self, ticker: str) -> str | None:
+        """Return the raw retrieval timestamp, including successful empty fetches."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT fetched_at FROM news_fetch_log WHERE ticker = ?", (ticker,)
+            ).fetchone()
+        return row["fetched_at"] if row else None
+
     def mark_news_fetched(self, ticker: str) -> None:
         """Record that news was just fetched for a ticker (or reserved market key)."""
         with self._conn() as conn:
@@ -396,6 +414,23 @@ class DataCache:
                 (provider, period),
             ).fetchone()
         return row["count"] if row else 0
+
+    def claim_rate_limit(self, provider: str, period: str, limit: int) -> bool:
+        """Atomically consume one quota unit, returning False when exhausted."""
+        if limit <= 0:
+            return False
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO rate_limits (provider, date, count) VALUES (?, ?, 0)",
+                (provider, period),
+            )
+            cursor = conn.execute(
+                "UPDATE rate_limits SET count = count + 1 "
+                "WHERE provider = ? AND date = ? AND count < ?",
+                (provider, period, limit),
+            )
+        return cursor.rowcount == 1
 
     def prune_rate_counts(self, provider: str, keep_period: str) -> None:
         """Drop stale rate-limit rows for a provider (buckets older than keep_period),

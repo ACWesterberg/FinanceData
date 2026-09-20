@@ -12,6 +12,7 @@ from datetime import datetime
 import yfinance as yf
 
 from .cache import get_cache
+from .contracts import DataProvenance, DataResult
 
 logger = logging.getLogger(__name__)
 
@@ -124,3 +125,31 @@ def get_fundamentals(
                     cache.save_fundamentals(ticker, data)
 
     return cache.get_all_fundamentals(tickers)
+
+
+def get_fundamentals_with_provenance(
+    tickers: list[str], *, as_of: str | None = None, ttl_days: int = 7,
+    max_workers: int = 12,
+) -> DataResult[dict[str, dict]]:
+    """Return current fundamentals with an explicit point-in-time capability.
+
+    Historical fundamentals are not available from the current provider/cache.
+    Therefore an ``as_of`` request intentionally returns no current data rather
+    than misrepresenting it as historical.
+    """
+    now = datetime.utcnow().isoformat()
+    if as_of is not None:
+        warning = "Historical fundamentals are unsupported; current values were not returned."
+        return DataResult({}, {ticker: DataProvenance(
+            provider_names=("yfinance",), requested_start=None, requested_end=as_of,
+            effective_start=None, effective_end=None, retrieved_at=now,
+            cache_state="unsupported", completeness="unavailable",
+            warnings=(warning,), historical_capability=False,
+        ) for ticker in tickers})
+    items = get_fundamentals(tickers, ttl_days=ttl_days, max_workers=max_workers)
+    return DataResult(items, {ticker: DataProvenance(
+        provider_names=("yfinance",), requested_start=None, requested_end=now,
+        effective_start=None, effective_end=now, retrieved_at=now,
+        cache_state="cache_or_refresh", completeness="complete" if ticker in items else "unavailable",
+        historical_capability=False,
+    ) for ticker in tickers})
